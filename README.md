@@ -15,7 +15,7 @@ Leaf exists because CotEditor slows down with many files open, and TextEdit is n
 - **Filter.** ⇧⌘L shows only the lines that contain some text or match a `/regex/`. On a 200 MB, 2.5 million line log this takes a few seconds.
 - **Highlighting** for about 200 languages, on a background thread, only for the lines you scroll to.
 - **Pages.** Markdown renders as a page and `.txt` reads as wrapped prose. Minified JSON opens formatted, and CSV/TSV files open as a table. ⇧⌘V switches to the raw lines.
-- **Notes.** ⌘N creates a Markdown note in `~/Documents/Leaf Notes`. Notes save as you type and take their name from the first line.
+- **Notes.** ⌘N (or ⌘T) creates a Markdown note in `~/Documents/Leaf Notes`. Notes save as you type and take their name from the first line.
 - **Encodings.** Shift_JIS, Windows-1252, UTF-16 and others are detected, and saving keeps the original encoding, BOM and line endings.
 - **Search open files.** The sidebar search (⇧⌘F) matches file names and the text inside every open file, and shows the matching line. Opening a result jumps to it.
 - **Compare.** ⇧⌘D compares the current file with the one you viewed before it, side by side. ⌥-click a file in the sidebar to compare with that one.
@@ -83,18 +83,19 @@ The script prints the previous app for each type, so you can switch back the sam
 | Keys | Action |
 |---|---|
 | ⌘O | Open files |
-| ⌘N | New note |
+| ⌘N, ⌘T | New note |
 | ⌘E, double-click | Edit / Done |
 | ⌘S | Save |
 | ⌘W | Close file |
 | ⇧⌘T | Reopen closed file |
-| ⌃Tab, ⇧⌃Tab | Next / previous file |
+| ⌃Tab, ⇧⌃Tab, ⌥⌘→, ⌥⌘← | Next / previous file |
+| ⌘1 … ⌘8, ⌘9 | Go to that file in the sidebar, last file |
 | ⌘F, ⌘G, ⇧⌘G | Find, next, previous match |
 | ⌘L | Go to line |
 | ⇧⌘L | Filter lines |
 | ⇧⌘V | Page, table or formatted view / raw lines |
 | ⇧⌘D, ⌥-click | Compare with the previous file / with that file |
-| ⌥⌘S | Show or hide the sidebar |
+| ⌘B, ⌥⌘S | Show or hide the sidebar |
 | ⇧⌘F, ⌥⌘F | Search open files |
 | Space, ⇧Space | Page down / up |
 | ⌘↑, ⌘↓ | Top / bottom |

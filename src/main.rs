@@ -29,6 +29,12 @@ actions!(
     [Quit, OpenFile, Save, CloseTab, ReopenClosed, ToggleEdit, NextTab, PrevTab, ToggleSidebar, FocusSearch, NewNote, CompareWithPrevious]
 );
 
+/// ⌘1–⌘8 open the file at that position in the sidebar; ⌘9 opens the last
+/// one (`usize::MAX`), as in browsers.
+#[derive(Action, Clone, PartialEq, serde::Deserialize)]
+#[action(namespace = leaf, no_json)]
+pub struct SelectTab(pub usize);
+
 fn main() {
     let app = gpui_kit::application().with_assets(LeafAssets);
 

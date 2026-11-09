@@ -31,7 +31,8 @@ use crate::session::{self, Session, SessionTab};
 use crate::text_index::{Bytes, Document};
 use crate::viewer::{RichKind, Viewer};
 use crate::{
-    CloseTab, CompareWithPrevious, FocusSearch, NewNote, NextTab, OpenFile, PrevTab, Quit, ReopenClosed, Save, ToggleEdit, ToggleSidebar,
+    CloseTab, CompareWithPrevious, FocusSearch, NewNote, NextTab, OpenFile, PrevTab, Quit, ReopenClosed, Save, SelectTab, ToggleEdit,
+    ToggleSidebar,
 };
 
 /// Tabs kept in memory at once. Everything else is just a path.
@@ -83,7 +84,21 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-tab", PrevTab, Some("Workspace")),
         KeyBinding::new("cmd-}", NextTab, Some("Workspace")),
         KeyBinding::new("cmd-{", PrevTab, Some("Workspace")),
+        // Browser-style tab keys.
+        KeyBinding::new("cmd-t", NewNote, None),
+        KeyBinding::new("cmd-alt-right", NextTab, Some("Workspace")),
+        KeyBinding::new("cmd-alt-left", PrevTab, Some("Workspace")),
+        KeyBinding::new("cmd-1", SelectTab(0), Some("Workspace")),
+        KeyBinding::new("cmd-2", SelectTab(1), Some("Workspace")),
+        KeyBinding::new("cmd-3", SelectTab(2), Some("Workspace")),
+        KeyBinding::new("cmd-4", SelectTab(3), Some("Workspace")),
+        KeyBinding::new("cmd-5", SelectTab(4), Some("Workspace")),
+        KeyBinding::new("cmd-6", SelectTab(5), Some("Workspace")),
+        KeyBinding::new("cmd-7", SelectTab(6), Some("Workspace")),
+        KeyBinding::new("cmd-8", SelectTab(7), Some("Workspace")),
+        KeyBinding::new("cmd-9", SelectTab(usize::MAX), Some("Workspace")),
         KeyBinding::new("cmd-alt-s", ToggleSidebar, Some("Workspace")),
+        KeyBinding::new("cmd-b", ToggleSidebar, Some("Workspace")),
         KeyBinding::new("cmd-alt-f", FocusSearch, Some("Workspace")),
         KeyBinding::new("cmd-shift-f", FocusSearch, Some("Workspace")),
         KeyBinding::new("cmd-shift-d", CompareWithPrevious, Some("Workspace")),
@@ -1194,6 +1209,13 @@ impl Workspace {
         self.cycle(-1, window, cx);
     }
 
+    fn on_select_tab(&mut self, action: &SelectTab, window: &mut Window, cx: &mut Context<Self>) {
+        let order = self.display_order();
+        if let Some(&ix) = order.get(action.0).or_else(|| (action.0 == usize::MAX).then(|| order.last()).flatten()) {
+            self.activate_index(ix, window, cx);
+        }
+    }
+
     fn on_new_note(&mut self, _: &NewNote, window: &mut Window, cx: &mut Context<Self>) {
         match notes::create_new_note() {
             Ok(path) => {
@@ -1654,6 +1676,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_quit))
             .on_action(cx.listener(Self::on_next))
             .on_action(cx.listener(Self::on_prev))
+            .on_action(cx.listener(Self::on_select_tab))
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_new_note))
             .on_action(cx.listener(Self::on_compare_previous))
