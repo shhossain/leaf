@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +13,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, h_flex,
     input::{Input, InputEvent, InputState},
     scroll::Scrollbar,
+    text::TextView,
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -26,7 +27,7 @@ actions!(
     viewer,
     [
         LineUp, LineDown, PageUp, PageDown, Top, Bottom, CopySelection, SelectAllText, Find,
-        FindNext, FindPrev, GoToLine, Dismiss
+        FindNext, FindPrev, GoToLine, Dismiss, TogglePreview
     ]
 );
 
@@ -35,6 +36,13 @@ const CHUNK_CACHE: usize = 8;
 const MAX_MATCHES: usize = 100_000;
 /// Lines parsed before a chunk when highlighting it without exact state.
 const WARMUP_LINES: usize = 64;
+/// Markdown bigger than this opens as source; rendering it all would be slow.
+const MAX_PREVIEW_BYTES: usize = 4 * 1024 * 1024;
+
+fn is_markdown(path: &Path) -> bool {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase());
+    matches!(ext.as_deref(), Some("md" | "markdown" | "mdown" | "mkd" | "mdx"))
+}
 
 pub fn init(cx: &mut App) {
     let list = Some("Viewer");
@@ -57,6 +65,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-g", FindNext, root),
         KeyBinding::new("cmd-shift-g", FindPrev, root),
         KeyBinding::new("cmd-l", GoToLine, root),
+        KeyBinding::new("cmd-shift-v", TogglePreview, root),
         KeyBinding::new("escape", Dismiss, Some("ViewerBar")),
     ]);
 }
@@ -108,6 +117,11 @@ pub struct Viewer {
     gutter_width: Pixels,
     font: Font,
     font_size: Pixels,
+    markdown: bool,
+    /// Rendered Markdown source while the preview is showing.
+    preview: Option<SharedString>,
+    /// Folder of the file; relative image paths in Markdown resolve against it.
+    base_dir: PathBuf,
 }
 
 impl Viewer {
@@ -115,7 +129,7 @@ impl Viewer {
         let syntax = (doc.len() <= highlight::MAX_HIGHLIGHT_BYTES)
             .then(|| highlight::find_syntax(path, &doc.text(doc.line_range(0))))
             .flatten();
-        Self {
+        let mut this = Self {
             doc,
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
@@ -136,7 +150,55 @@ impl Viewer {
             gutter_width: px(60.),
             font: font("Menlo"),
             font_size: px(13.),
+            markdown: is_markdown(path),
+            preview: None,
+            base_dir: path.parent().map(Path::to_path_buf).unwrap_or_default(),
+        };
+        // Viewer-first: Markdown opens rendered; ⌘⇧V shows the source.
+        if this.markdown && this.doc.len() <= MAX_PREVIEW_BYTES {
+            this.preview = Some(this.doc.text(0..this.doc.len()).into_owned().into());
         }
+        this
+    }
+
+    pub fn is_previewing(&self) -> bool {
+        self.preview.is_some()
+    }
+
+    fn on_toggle_preview(&mut self, _: &TogglePreview, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.markdown {
+            return;
+        }
+        if self.preview.take().is_none() && self.doc.len() <= MAX_PREVIEW_BYTES {
+            self.preview = Some(self.doc.text(0..self.doc.len()).into_owned().into());
+        }
+        cx.notify();
+    }
+
+    fn render_preview(&self, text: SharedString, cx: &mut Context<Self>) -> impl IntoElement {
+        let base = self.base_dir.clone();
+        div()
+            .id("preview")
+            .key_context("Viewer")
+            .track_focus(&self.focus)
+            .flex_1()
+            .min_h_0()
+            .child(
+                TextView::markdown(("markdown", cx.entity_id().as_u64() as usize), text)
+                    .selectable(true)
+                    .scrollable(true)
+                    .image_source(move |uri| {
+                        let uri_text = uri.to_string();
+                        if uri_text.contains("://") || uri_text.starts_with("data:") {
+                            ImageSource::from(uri.clone())
+                        } else {
+                            ImageSource::from(base.join(uri_text.trim_start_matches("./")))
+                        }
+                    })
+                    .size_full()
+                    .px_10()
+                    .py_6(),
+            )
     }
 
     pub fn doc(&self) -> &Arc<Document> {
@@ -490,6 +552,7 @@ impl Viewer {
     // ── find ───────────────────────────────────────────────────────────────
 
     fn on_find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        self.preview = None; // find works on lines: show the source
         if self.find.is_none() {
             let input = cx.new(|cx| InputState::new(window, cx).placeholder("Find"));
             let events = cx.subscribe(&input, |this, _, event: &InputEvent, cx| match event {
@@ -572,6 +635,7 @@ impl Viewer {
     // ── go to line ─────────────────────────────────────────────────────────
 
     fn on_goto(&mut self, _: &GoToLine, window: &mut Window, cx: &mut Context<Self>) {
+        self.preview = None;
         let input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(format!("Go to line (1–{})", self.doc.line_count()))
         });
@@ -659,6 +723,7 @@ impl Render for Viewer {
             .on_action(cx.listener(Self::on_find_prev))
             .on_action(cx.listener(Self::on_goto))
             .on_action(cx.listener(Self::on_dismiss))
+            .on_action(cx.listener(Self::on_toggle_preview))
             .when_some(self.goto.as_ref(), |this, goto| {
                 this.child(self.render_bar(Input::new(&goto.input).small(), cx))
             })
@@ -676,7 +741,8 @@ impl Render for Viewer {
                         .child(div().text_xs().text_color(muted).child("⏎ next · ⇧⏎ previous · esc close")),
                 )
             })
-            .child(
+            .when_some(self.preview.clone(), |this, text| this.child(self.render_preview(text, cx)))
+            .when(self.preview.is_none(), |this| this.child(
                 div()
                     .id("viewer")
                     .key_context("Viewer")
@@ -701,7 +767,7 @@ impl Render for Viewer {
                     .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.dragging = false))
                     .child(list)
                     .child(Scrollbar::new(&self.scroll)),
-            )
+            ))
     }
 }
 

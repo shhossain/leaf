@@ -758,8 +758,8 @@ impl Workspace {
         if let Some(tab) = self.active_tab() {
             if let TabState::Editing { .. } = tab.state {
                 (mode, mode_color) = ("EDIT", theme.warning);
-            } else if tab.is_live() {
-                mode = "VIEW";
+            } else if let TabState::Viewing { viewer, .. } = &tab.state {
+                mode = if viewer.read(cx).is_previewing() { "PREVIEW" } else { "VIEW" };
             }
             warning = tab.conflict.map(|c| format!("⚠ {c}"));
             if let TabState::Viewing { viewer, .. } = &tab.state {

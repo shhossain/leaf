@@ -98,6 +98,7 @@ fn menus() -> Vec<Menu> {
             name: "View".into(),
             items: vec![
                 MenuItem::action("Toggle Edit Mode", ToggleEdit),
+                MenuItem::action("Markdown Preview", viewer::TogglePreview),
                 MenuItem::separator(),
                 MenuItem::action("Next Tab", NextTab),
                 MenuItem::action("Previous Tab", PrevTab),
