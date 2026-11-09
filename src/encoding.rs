@@ -59,6 +59,14 @@ pub fn decode(bytes: Vec<u8>) -> Decoded {
     Decoded { utf8: text.into_owned().into_bytes(), encoding, bom: false, lossy }
 }
 
+/// True if saving `utf8` in `encoding` reproduces `original` byte for byte.
+/// Some legacy sequences decode cleanly but encode differently (Shift_JIS
+/// `ED 40` comes back as `FA 5C`); such files must not be edited.
+pub fn round_trips(original: &[u8], utf8: &str, encoding: &'static Encoding, bom: bool) -> bool {
+    let (bytes, unmappable) = encode(utf8, TextFormat { encoding, bom, crlf: false });
+    !unmappable && bytes == original
+}
+
 /// Converts editor text back to the file's line endings and encoding.
 /// Returns the bytes and whether some characters could not be represented.
 pub fn encode(text: &str, format: TextFormat) -> (Vec<u8>, bool) {
@@ -124,6 +132,18 @@ mod tests {
         let d = decode(le.clone());
         assert_eq!(String::from_utf8(d.utf8).unwrap(), "hi ü\r\n");
         round_trip(&le);
+    }
+
+    #[test]
+    fn notices_sequences_that_do_not_round_trip() {
+        // NEC-selected IBM extension in Shift_JIS: decodes, but encodes as FA 5C.
+        let original = b"abc \xED\x40 def\n".to_vec();
+        let (text, had_errors) = encoding_rs::SHIFT_JIS.decode_without_bom_handling(&original);
+        assert!(!had_errors, "decodes cleanly");
+        assert!(!round_trips(&original, &text, encoding_rs::SHIFT_JIS, false));
+        let clean = b"caf\xE9\n".to_vec();
+        let d = decode(clean.clone());
+        assert!(round_trips(&clean, std::str::from_utf8(&d.utf8).unwrap(), d.encoding, d.bom));
     }
 
     #[test]

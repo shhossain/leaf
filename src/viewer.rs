@@ -36,6 +36,12 @@ const CHUNK_CACHE: usize = 8;
 const MAX_MATCHES: usize = 100_000;
 /// Lines parsed before a chunk when highlighting it without exact state.
 const WARMUP_LINES: usize = 64;
+/// Frames to wait for the line list's first layout before dropping a scroll.
+const MAX_SCROLL_RETRIES: u8 = 5;
+/// The exact highlighting pass only walks this many chunks ahead of its last
+/// checkpoint. A far jump (⌘↓ in a big file) keeps the approximate colors
+/// instead of parsing everything in between (~23 s of CPU for 7 MB).
+const MAX_EXACT_GAP_CHUNKS: usize = 50;
 /// Markdown bigger than this opens as source; rendering it all would be slow.
 const MAX_PREVIEW_BYTES: usize = 4 * 1024 * 1024;
 /// Plain text above this keeps the line-based view (it's virtualized; prose isn't).
@@ -193,6 +199,7 @@ pub struct Viewer {
     flash_line: Option<usize>,
     /// `(line, center)` to scroll to on the next render.
     pending_scroll: Option<(usize, bool)>,
+    pending_scroll_retries: u8,
     // Set in `render`, used by hit-testing.
     row_height: Pixels,
     gutter_width: Pixels,
@@ -231,6 +238,7 @@ impl Viewer {
             goto: None,
             flash_line: None,
             pending_scroll: None,
+            pending_scroll_retries: 0,
             row_height: px(20.),
             gutter_width: px(60.),
             font: font("Menlo"),
@@ -331,12 +339,25 @@ impl Viewer {
     /// Applies a requested scroll once the viewport has been laid out.
     fn apply_pending_scroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((line, center)) = self.pending_scroll else { return };
+        // The line list isn't laid out while a page is showing; the scroll
+        // waits until the source lines are shown (it used to re-render every
+        // frame here, forever).
+        if self.preview.is_some() {
+            return;
+        }
         let handle = self.scroll.0.borrow().base_handle.clone();
         let viewport = handle.bounds().size.height;
         if viewport <= px(0.) {
-            cx.on_next_frame(window, |_, _, cx| cx.notify());
+            // Not laid out yet: retry on the next frame, but only a few times.
+            self.pending_scroll_retries += 1;
+            if self.pending_scroll_retries > MAX_SCROLL_RETRIES {
+                self.pending_scroll = None;
+            } else {
+                cx.on_next_frame(window, |_, _, cx| cx.notify());
+            }
             return;
         }
+        self.pending_scroll_retries = 0;
         let content = self.row_height * self.doc.line_count() as f32;
         let max = (content - viewport).max(px(0.));
         let mut y = self.row_height * line.min(self.doc.line_count() - 1) as f32;
@@ -370,6 +391,9 @@ impl Viewer {
     /// only ever parses as far as the reader has scrolled, then idles.
     fn want_chunk(&mut self, chunk: usize, cx: &mut Context<Self>) {
         let Some(syntax) = self.syntax else { return };
+        if chunk > self.checkpoints.len() + MAX_EXACT_GAP_CHUNKS {
+            return;
+        }
         let total = self.doc.line_count().div_ceil(CHUNK);
         self.wanted_chunk = self.wanted_chunk.max(chunk.min(total - 1));
         if self.pass_running || self.checkpoints.len() > self.wanted_chunk {

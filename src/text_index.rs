@@ -34,7 +34,10 @@ pub struct Document {
     checkpoints: Vec<usize>,
     line_count: usize,
     longest_line: usize,
+    /// Every line ends in `\r\n`; saving converts new lines back to CRLF.
     pub crlf: bool,
+    /// Some lines end in `\r\n` and others in `\n`; saving leaves them as they are.
+    pub mixed_eol: bool,
     pub lossy: bool,
 }
 
@@ -57,10 +60,13 @@ impl Document {
         if data.len() - start > longest_len {
             longest_line = line;
         }
-        let head = &data[..data.len().min(64 * 1024)];
-        let crlf = memchr::memmem::find(head, b"\r\n").is_some();
+        // Judge line endings over the whole file: a file that starts CRLF and
+        // continues LF must not be converted wholesale on save.
+        let crlf_count = memchr::memmem::find_iter(data, b"\r\n").count();
+        let crlf = crlf_count > 0 && crlf_count == line;
+        let mixed_eol = crlf_count > 0 && crlf_count < line;
         let lossy = check_utf8 && std::str::from_utf8(data).is_err();
-        Self { bytes, checkpoints, line_count: line + 1, longest_line, crlf, lossy }
+        Self { bytes, checkpoints, line_count: line + 1, longest_line, crlf, mixed_eol, lossy }
     }
 
     pub fn len(&self) -> usize {
@@ -211,6 +217,14 @@ mod tests {
             assert_eq!(d.line_of_offset(r.start), line);
             assert_eq!(d.line_of_offset(r.end), line);
         }
+    }
+
+    #[test]
+    fn line_endings_are_judged_over_the_whole_file() {
+        assert!(doc("a\r\nb\r\n").crlf);
+        let mixed = doc("a\r\nb\nc\n");
+        assert!(!mixed.crlf && mixed.mixed_eol);
+        assert!(!doc("a\nb\n").crlf);
     }
 
     #[test]

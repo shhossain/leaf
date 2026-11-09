@@ -5,6 +5,7 @@ mod encoding;
 mod file_list;
 mod highlight;
 mod notes;
+mod recovery;
 mod session;
 mod style;
 mod text_index;

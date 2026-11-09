@@ -59,9 +59,16 @@ pub fn load(path: &Path) -> std::io::Result<Loaded> {
     if looks_binary(&data) {
         return Ok(Loaded::Binary { bytes: meta.len() });
     }
+    // Plain UTF-8 needs no check; anything converted must survive a round trip.
+    let original = (encoding::has_bom(&data) || std::str::from_utf8(&data).is_err()).then(|| data.clone());
     let decoded = encoding::decode(data);
+    let mut lossy = decoded.lossy;
+    if let (Some(original), false) = (original, lossy) {
+        let text = std::str::from_utf8(&decoded.utf8).expect("decoder output is UTF-8");
+        lossy = !encoding::round_trips(&original, text, decoded.encoding, decoded.bom);
+    }
     let mut doc = Document::new(Bytes::Owned(decoded.utf8), false);
-    doc.lossy = decoded.lossy;
+    doc.lossy = lossy;
     let format = TextFormat { encoding: decoded.encoding, bom: decoded.bom, crlf: doc.crlf };
     Ok(Loaded::Doc { doc: Arc::new(doc), format, stamp })
 }
@@ -86,6 +93,35 @@ pub fn indents_with_tabs(doc: &Document) -> bool {
     tabbed > spaced || head.first() == Some(&b'\t')
 }
 
+/// Replaces `path` with `bytes` without ever leaving a half-written file: the
+/// data goes to a temporary file in the same folder, is flushed to disk, and
+/// is renamed over the original. Symlinks and hard-linked files are written in
+/// place instead, so the link (not a copy) keeps pointing at the new contents.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let link_meta = std::fs::symlink_metadata(path).ok();
+    let in_place = link_meta.as_ref().is_some_and(|m| m.file_type().is_symlink() || m.nlink() > 1);
+    let Some(dir) = path.parent().filter(|_| !in_place) else {
+        return std::fs::write(path, bytes);
+    };
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.leaf-{}.tmp", std::process::id()));
+    let result = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        if let Some(meta) = &link_meta {
+            std::fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut value = bytes as f64;
@@ -95,4 +131,26 @@ pub fn human_size(bytes: u64) -> String {
         unit += 1;
     }
     if unit == 0 { format!("{bytes} B") } else { format!("{value:.1} {}", UNITS[unit]) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_write_replaces_files_and_keeps_symlinks() {
+        let dir = std::env::temp_dir().join(format!("leaf-write-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "old").unwrap();
+        write_atomic(&file, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+        let link = dir.join("link.txt");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        write_atomic(&link, b"via link").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "via link");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "no temp files left behind");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

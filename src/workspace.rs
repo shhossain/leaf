@@ -25,7 +25,7 @@ use gpui_kit::*;
 use crate::doc::{self, DiskStamp, Loaded};
 use crate::encoding::{self, TextFormat};
 use crate::file_list::{self, FileMeta};
-use crate::{notes, style};
+use crate::{notes, recovery, style};
 use crate::session::{self, Session, SessionTab};
 use crate::text_index::{Bytes, Document};
 use crate::viewer::Viewer;
@@ -107,6 +107,8 @@ struct DocTab {
     /// Open in the editor as soon as it loads (a freshly created note).
     start_editing: bool,
     autosave: Option<Task<()>>,
+    /// Debounced copy of unsaved text to the recovery folder.
+    recovery_task: Option<Task<()>>,
 }
 
 impl DocTab {
@@ -127,6 +129,7 @@ impl DocTab {
             note,
             start_editing: false,
             autosave: None,
+            recovery_task: None,
         }
     }
 
@@ -162,6 +165,13 @@ impl DocTab {
             _ => self.top_line,
         }
     }
+}
+
+/// Why a write didn't happen.
+enum WriteError {
+    /// The file changed on disk since we read it; ask before overwriting.
+    Conflict,
+    Failed(String),
 }
 
 /// One entry in the virtualized sidebar list.
@@ -209,7 +219,16 @@ impl Workspace {
         window.on_window_should_close(cx, move |window, cx| {
             weak.update(cx, |this, cx| this.confirm_quit(window, cx)).unwrap_or(true)
         });
+        // Quitting from the Dock, logout and restart skip our prompt: save notes
+        // and keep a recovery copy of everything else that is unsaved.
         cx.on_app_quit(|this, cx| {
+            let dirty: Vec<(u64, bool)> = this.tabs.iter().filter(|t| t.dirty).map(|t| (t.id, t.note)).collect();
+            for (id, note) in dirty {
+                if note {
+                    let _ = this.write_tab(id, false, cx);
+                }
+                this.write_recovery(id, cx); // no-op once saved
+            }
             session::save(&this.session(cx));
             async {}
         })
@@ -427,9 +446,18 @@ impl Workspace {
         let Some(ix) = self.index_of(id) else { return }; // closed while loading
         let read_time = started.elapsed();
         self.tabs[ix].state = match result {
-            Ok(Loaded::Doc { doc, format, stamp }) => {
+            Ok(Loaded::Doc { mut doc, format, stamp }) => {
                 let tab = &mut self.tabs[ix];
                 (tab.format, tab.stamp, tab.conflict) = (format, Some(stamp), None);
+                // Edits that were never saved (crash, Dock quit) come back as unsaved changes.
+                if let Some(text) = recovery::load(&tab.path) {
+                    if text.as_bytes() == doc.bytes() {
+                        recovery::discard(&tab.path);
+                    } else {
+                        doc = Arc::new(Document::new(Bytes::Owned(text.into_bytes()), false));
+                        tab.dirty = true;
+                    }
+                }
                 let line = tab.top_line;
                 self.viewing(ix, doc, line, cx)
             }
@@ -551,7 +579,7 @@ impl Workspace {
         let id = self.tabs[ix].id;
         // Leaving a note's editor saves it, as Notes would.
         if self.tabs[ix].note && self.tabs[ix].dirty && matches!(self.tabs[ix].state, TabState::Editing { .. }) {
-            let _ = self.write_tab(id, cx);
+            let _ = self.write_tab(id, false, cx);
         }
         let Some(ix) = self.index_of(id) else { return };
         match &self.tabs[ix].state {
@@ -571,7 +599,7 @@ impl Workspace {
                     Some(format!("Editing is available for files up to {}.", doc::human_size(doc::MAX_EDIT_BYTES as u64)))
                 } else if doc.lossy {
                     Some(format!(
-                        "It contains bytes that aren't valid {}. Saving would replace them, so editing is off to protect the file.",
+                        "It contains bytes that can't be saved back exactly as {}, so editing is off to protect the file.",
                         self.tabs[ix].format.encoding.name()
                     ))
                 } else {
@@ -598,6 +626,7 @@ impl Workspace {
                     if matches!(event, InputEvent::Change) {
                         this.set_dirty(id, true, cx);
                         this.schedule_autosave(id, cx);
+                        this.schedule_recovery(id, cx);
                     }
                 });
                 // Keep the reader's place: the text reaches the editor on its first paint.
@@ -624,65 +653,90 @@ impl Workspace {
     }
 
     /// Writes the tab to disk in its original encoding, BOM and line endings.
-    /// Returns false if it could not be saved.
+    /// Asks before replacing a file that changed on disk. Returns false if it
+    /// was not saved (yet).
     fn save_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(ix) = self.index_of(id) else { return false };
-        let tab = &self.tabs[ix];
-        if !tab.dirty {
+        if !self.tabs[ix].dirty {
             return true;
         }
-        if let Some(conflict) = tab.conflict {
-            // Never silently replace someone else's change; ask, then save again.
-            let answer = window.prompt(
-                PromptLevel::Warning,
-                &format!("{} was {conflict} since Leaf opened it.", tab.title),
-                Some("Saving replaces the version on disk with yours."),
-                &["Overwrite", "Cancel"],
-                cx,
-            );
-            cx.spawn_in(window, async move |this, cx| {
-                if answer.await == Ok(0) {
-                    this.update_in(cx, |this, window, cx| {
-                        if let Some(ix) = this.index_of(id) {
-                            this.tabs[ix].conflict = None;
-                            this.save_tab(id, window, cx);
-                        }
-                    })
-                    .ok();
-                }
-            })
-            .detach();
-            return false;
+        let result = if self.tabs[ix].conflict.is_some() { Err(WriteError::Conflict) } else { self.write_tab(id, false, cx) };
+        match result {
+            Ok(()) => true,
+            Err(WriteError::Conflict) => {
+                // Never silently replace someone else's change; ask first.
+                let tab = &self.tabs[ix];
+                let answer = window.prompt(
+                    PromptLevel::Warning,
+                    &format!("{} was {} since Leaf opened it.", tab.title, tab.conflict.unwrap_or("changed on disk")),
+                    Some("Saving replaces the version on disk with yours."),
+                    &["Overwrite", "Cancel"],
+                    cx,
+                );
+                cx.spawn_in(window, async move |this, cx| {
+                    if answer.await == Ok(0) {
+                        this.update_in(cx, |this, window, cx| {
+                            if let Err(WriteError::Failed(detail)) = this.write_tab(id, true, cx) {
+                                this.show_save_error(id, &detail, window, cx);
+                            }
+                        })
+                        .ok();
+                    }
+                })
+                .detach();
+                false
+            }
+            Err(WriteError::Failed(detail)) => {
+                self.show_save_error(id, &detail, window, cx);
+                false
+            }
         }
-        if let Err(detail) = self.write_tab(id, cx) {
-            let title = format!("Could not save {}", self.tabs[ix].title);
-            let _ = window.prompt(PromptLevel::Critical, &title, Some(&detail), &["OK"], cx);
-            return false;
+    }
+
+    fn show_save_error(&self, id: u64, detail: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let title = self.index_of(id).map(|ix| format!("Could not save {}", self.tabs[ix].title)).unwrap_or_default();
+        let _ = window.prompt(PromptLevel::Critical, &title, Some(detail), &["OK"], cx);
+    }
+
+    /// The tab's current text: the editor's, or the (edited) document's.
+    fn tab_text(&self, ix: usize, cx: &App) -> Option<String> {
+        match &self.tabs[ix].state {
+            TabState::Editing { editor, .. } => Some(editor.read(cx).text().to_string()),
+            TabState::Viewing { viewer, .. } => {
+                let doc = viewer.read(cx).doc();
+                Some(doc.text(0..doc.len()).into_owned())
+            }
+            _ => None,
         }
-        true
     }
 
     /// Writes the tab in its original encoding, BOM and line endings, without
-    /// asking anything. Notes are also renamed after their first line.
-    fn write_tab(&mut self, id: u64, cx: &mut Context<Self>) -> Result<(), String> {
-        let ix = self.index_of(id).ok_or("The file was closed.")?;
-        let tab = &self.tabs[ix];
-        if !tab.dirty {
+    /// prompting. Unless `overwrite` is set, a file that changed on disk since
+    /// we read it is left alone and flagged as a conflict (auto-save must never
+    /// clobber an edit synced from another Mac). Notes are renamed after their
+    /// first line.
+    fn write_tab(&mut self, id: u64, overwrite: bool, cx: &mut Context<Self>) -> Result<(), WriteError> {
+        let ix = self.index_of(id).ok_or_else(|| WriteError::Failed("The file was closed.".into()))?;
+        if !self.tabs[ix].dirty {
             return Ok(());
         }
-        let text: String = match &tab.state {
-            TabState::Editing { editor, .. } => editor.read(cx).text().to_string(),
-            TabState::Viewing { viewer, .. } => viewer.read(cx).doc().text(0..viewer.read(cx).doc().len()).into_owned(),
-            _ => return Err("Nothing to save.".into()),
-        };
+        let on_disk = doc::stamp(&self.tabs[ix].path);
+        if !overwrite && self.tabs[ix].stamp.is_some() && on_disk != self.tabs[ix].stamp {
+            self.tabs[ix].conflict = Some(if on_disk.is_some() { "changed on disk" } else { "deleted on disk" });
+            cx.notify();
+            return Err(WriteError::Conflict);
+        }
+        let text = self.tab_text(ix, cx).ok_or_else(|| WriteError::Failed("Nothing to save.".into()))?;
+        let tab = &self.tabs[ix];
         let (bytes, unmappable) = encoding::encode(&text, tab.format);
         if unmappable {
-            return Err(format!(
+            return Err(WriteError::Failed(format!(
                 "Some characters can't be represented in {}. Remove them, or save a copy as UTF-8.",
                 tab.format.encoding.name()
-            ));
+            )));
         }
-        std::fs::write(&tab.path, bytes).map_err(|err| err.to_string())?;
+        doc::write_atomic(&tab.path, &bytes).map_err(|err| WriteError::Failed(err.to_string()))?;
+        recovery::discard(&tab.path);
         if tab.note {
             self.rename_note(ix, &text);
         }
@@ -704,6 +758,31 @@ impl Workspace {
         }
     }
 
+    /// Copies unsaved text to the recovery folder a moment after typing stops,
+    /// so a crash or a Dock quit loses nothing. (Notes save themselves.)
+    fn schedule_recovery(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(ix) = self.index_of(id) else { return };
+        if self.tabs[ix].note {
+            return;
+        }
+        self.tabs[ix].recovery_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            this.update(cx, |this, cx| this.write_recovery(id, cx)).ok();
+        }));
+    }
+
+    fn write_recovery(&mut self, id: u64, cx: &App) {
+        let Some(ix) = self.index_of(id) else { return };
+        if !self.tabs[ix].dirty {
+            return;
+        }
+        if let Some(text) = self.tab_text(ix, cx) {
+            if let Err(err) = recovery::save(&self.tabs[ix].path, &text) {
+                eprintln!("[leaf] could not write recovery copy: {err}");
+            }
+        }
+    }
+
     /// Notes save themselves shortly after the last keystroke.
     fn schedule_autosave(&mut self, id: u64, cx: &mut Context<Self>) {
         let Some(ix) = self.index_of(id) else { return };
@@ -713,7 +792,7 @@ impl Workspace {
         self.tabs[ix].autosave = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(700)).await;
             this.update(cx, |this, cx| {
-                if let Err(err) = this.write_tab(id, cx) {
+                if let Err(WriteError::Failed(err)) = this.write_tab(id, false, cx) {
                     eprintln!("[leaf] auto-save failed: {err}");
                 }
             })
@@ -726,7 +805,7 @@ impl Workspace {
     fn close_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.index_of(id) else { return };
         if self.tabs[ix].note && self.tabs[ix].dirty {
-            let _ = self.write_tab(id, cx); // notes never ask
+            let _ = self.write_tab(id, false, cx); // notes never ask
         }
         let Some(ix) = self.index_of(id) else { return };
         if !self.tabs[ix].dirty {
@@ -760,6 +839,7 @@ impl Workspace {
         let next = order.get(pos + 1).or(pos.checked_sub(1).and_then(|p| order.get(p))).map(|&o| self.tabs[o].id);
         let line = self.tabs[ix].current_line(cx);
         let tab = self.tabs.remove(ix);
+        recovery::discard(&tab.path);
         let empty_note = tab.note && !tab.dirty && std::fs::metadata(&tab.path).is_ok_and(|m| m.len() == 0);
         if empty_note {
             let _ = std::fs::remove_file(&tab.path); // like Notes, empty notes don't stick around
@@ -788,7 +868,7 @@ impl Workspace {
     fn confirm_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let notes: Vec<u64> = self.tabs.iter().filter(|t| t.note && t.dirty).map(|t| t.id).collect();
         for id in notes {
-            let _ = self.write_tab(id, cx);
+            let _ = self.write_tab(id, false, cx);
         }
         session::save(&self.session(cx));
         let dirty: Vec<u64> = self.tabs.iter().filter(|t| t.dirty).map(|t| t.id).collect();
@@ -811,7 +891,14 @@ impl Workspace {
             this.update_in(cx, |this, window, cx| {
                 let quit = match choice {
                     0 => dirty.iter().all(|&id| this.save_tab(id, window, cx)),
-                    1 => true,
+                    1 => {
+                        for &id in &dirty {
+                            if let Some(ix) = this.index_of(id) {
+                                recovery::discard(&this.tabs[ix].path);
+                            }
+                        }
+                        true
+                    }
                     _ => false,
                 };
                 if quit {
@@ -1274,6 +1361,9 @@ impl Workspace {
             details.push(encoding);
             if tab.format.crlf {
                 details.push("CRLF".into());
+            }
+            if doc.mixed_eol {
+                details.push("Mixed line endings".into());
             }
         }
         (details, tab.conflict.map(|c| format!("⚠ {c}")))
