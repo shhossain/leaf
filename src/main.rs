@@ -1,7 +1,9 @@
 //! Leaf: a lightweight, viewer-first text editor for macOS with lazy tabs.
 
 mod doc;
+mod encoding;
 mod highlight;
+mod session;
 mod text_index;
 mod viewer;
 mod workspace;
@@ -15,7 +17,7 @@ use gpui_kit::*;
 
 use workspace::Workspace;
 
-actions!(leaf, [Quit, OpenFile, Save, CloseTab, ToggleEdit, NextTab, PrevTab]);
+actions!(leaf, [Quit, OpenFile, Save, CloseTab, ReopenClosed, ToggleEdit, NextTab, PrevTab]);
 
 fn main() {
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
@@ -57,7 +59,12 @@ fn main() {
         // Phase 0: one window; closing it quits. (Reopen-on-Dock-click comes later.)
         cx.on_window_closed(|cx, _| cx.quit()).detach();
 
-        workspace.update(cx, |ws, cx| ws.open_paths(cli_paths, cx));
+        // Previous tabs come back cold (nothing is read until shown); files
+        // passed on the command line open on top and become active.
+        workspace.update(cx, |ws, cx| {
+            ws.restore(session::load(), cx);
+            ws.open_paths(cli_paths, cx);
+        });
         cx.spawn(async move |cx| {
             while let Some(paths) = open_rx.next().await {
                 cx.update(|cx| workspace.update(cx, |ws, cx| ws.open_paths(paths, cx)));
@@ -83,6 +90,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Save", Save),
                 MenuItem::separator(),
                 MenuItem::action("Close Tab", CloseTab),
+                MenuItem::action("Reopen Closed Tab", ReopenClosed),
             ],
             disabled: false,
         },

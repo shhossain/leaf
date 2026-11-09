@@ -10,9 +10,14 @@ license = "Apache-2.0"
 # `syntect`: ~200 languages, small build. Swap to `tree-sitter` features later if needed.
 gpui-kit = { version = "=0.9.0", features = ["syntect"] }
 futures = "0.3"
+chardetng = "1"
+dirs = "6"
+encoding_rs = "0.8"
 memchr = "2"
 memmap2 = "0.9"
 regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # Same versions/features gpui-component already compiles, so no extra build cost.
 syntect = { version = "5.3", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }
 two-face = { version = "0.4.5", default-features = false, features = ["syntect-fancy"] }
