@@ -26,7 +26,7 @@ use workspace::Workspace;
 
 actions!(
     leaf,
-    [Quit, OpenFile, Save, CloseTab, ReopenClosed, ToggleEdit, NextTab, PrevTab, ToggleSidebar, FocusSearch, NewNote]
+    [Quit, OpenFile, Save, CloseTab, ReopenClosed, ToggleEdit, NextTab, PrevTab, ToggleSidebar, FocusSearch, NewNote, CompareWithPrevious]
 );
 
 fn main() {
@@ -141,6 +141,8 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Page / Source Lines", viewer::TogglePreview),
                 MenuItem::action("Show/Hide Sidebar", ToggleSidebar),
                 MenuItem::action("Search in Open Files", FocusSearch),
+                MenuItem::separator(),
+                MenuItem::action("Compare with Previous File  (or ⌥-click a file)", CompareWithPrevious),
                 MenuItem::separator(),
                 MenuItem::action("Next Tab", NextTab),
                 MenuItem::action("Previous Tab", PrevTab),

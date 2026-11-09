@@ -16,6 +16,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
+    diff::{Diff, DiffFile, DiffMode, DiffState},
     input::{Editor, EditorState, Input, InputEvent, InputState, Position, TabSize},
     v_flex,
 };
@@ -30,7 +31,7 @@ use crate::session::{self, Session, SessionTab};
 use crate::text_index::{Bytes, Document};
 use crate::viewer::{RichKind, Viewer};
 use crate::{
-    CloseTab, FocusSearch, NewNote, NextTab, OpenFile, PrevTab, Quit, ReopenClosed, Save, ToggleEdit, ToggleSidebar,
+    CloseTab, CompareWithPrevious, FocusSearch, NewNote, NextTab, OpenFile, PrevTab, Quit, ReopenClosed, Save, ToggleEdit, ToggleSidebar,
 };
 
 /// Tabs kept in memory at once. Everything else is just a path.
@@ -43,6 +44,26 @@ const SIDEBAR_WIDTH: f32 = 290.;
 const TOOLBAR_HEIGHT: f32 = 52.;
 /// Room for the traffic lights, which sit inside the toolbar like in Notes.
 const TRAFFIC_LIGHTS_WIDTH: f32 = 78.;
+
+/// A unified diff of two text files (both decoded to UTF-8), for the diff view.
+fn unified_diff(left: &std::path::Path, right: &std::path::Path) -> Result<String, String> {
+    const MAX_COMPARE_BYTES: u64 = 8 * 1024 * 1024;
+    let read = |path: &std::path::Path| -> Result<String, String> {
+        let len = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+        if len > MAX_COMPARE_BYTES {
+            return Err(format!("{} is too large to compare (over 8 MB).", path.display()));
+        }
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        Ok(String::from_utf8_lossy(&encoding::decode(bytes).utf8).into_owned())
+    };
+    let (a, b) = (read(left)?, read(right)?);
+    let name = |p: &std::path::Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    Ok(similar::TextDiff::from_lines(&a, &b)
+        .unified_diff()
+        .context_radius(3)
+        .header(&format!("a/{}", name(left)), &format!("b/{}", name(right)))
+        .to_string())
+}
 
 /// Notes hide their extension, like titles in Notes; other files show it.
 fn display_title(path: &std::path::Path, note: bool) -> String {
@@ -65,6 +86,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-alt-s", ToggleSidebar, Some("Workspace")),
         KeyBinding::new("cmd-alt-f", FocusSearch, Some("Workspace")),
         KeyBinding::new("cmd-shift-f", FocusSearch, Some("Workspace")),
+        KeyBinding::new("cmd-shift-d", CompareWithPrevious, Some("Workspace")),
     ]);
 }
 
@@ -173,6 +195,14 @@ impl DocTab {
     }
 }
 
+/// A side-by-side comparison of two files.
+struct Compare {
+    title: SharedString,
+    /// `None`: the files are identical (or couldn't be read).
+    state: Option<Entity<DiffState>>,
+    message: Option<SharedString>,
+}
+
 /// Why a write didn't happen.
 enum WriteError {
     /// The file changed on disk since we read it; ask before overwriting.
@@ -197,6 +227,8 @@ pub struct Workspace {
     next_id: u64,
     focus: FocusHandle,
     sidebar_open: bool,
+    /// Two files shown side by side (⌥-click a file in the sidebar).
+    compare: Option<Compare>,
     /// Sidebar search inside files: tab id → first matching line, for `content_query`.
     content_hits: std::collections::HashMap<u64, String>,
     content_query: String,
@@ -275,6 +307,7 @@ impl Workspace {
             next_id: 1,
             focus,
             sidebar_open: true,
+            compare: None,
             content_hits: Default::default(),
             content_query: String::new(),
             _content_search: None,
@@ -368,6 +401,38 @@ impl Workspace {
         self.next_id += 1;
         self.tabs.push(DocTab::new(id, path));
         id
+    }
+
+    // ── comparing files ────────────────────────────────────────────────────
+
+    /// Compares the open file (left) with `other` (right), side by side.
+    fn compare_with(&mut self, other: u64, cx: &mut Context<Self>) {
+        let (Some(left), Some(right)) = (self.active_index(), self.index_of(other)) else { return };
+        if left == right {
+            return;
+        }
+        let (left_path, right_path) = (self.tabs[left].path.clone(), self.tabs[right].path.clone());
+        let title: SharedString = format!("{}  ↔  {}", self.tabs[left].title, self.tabs[right].title).into();
+        self.compare = Some(Compare { title: title.clone(), state: None, message: Some("Comparing…".into()) });
+        cx.spawn(async move |this, cx| {
+            let patch = cx.background_executor().spawn(async move { unified_diff(&left_path, &right_path) }).await;
+            this.update(cx, |this, cx| {
+                let Some(compare) = this.compare.as_mut().filter(|c| c.title == title) else { return };
+                match patch.map(|patch| DiffFile::parse(&patch)) {
+                    Ok(Ok(files)) if !files.is_empty() => {
+                        compare.state = Some(cx.new(|cx| DiffState::new(files, cx).with_mode(DiffMode::Split)));
+                        compare.message = None;
+                    }
+                    Ok(Ok(_)) => compare.message = Some("The files are identical.".into()),
+                    Ok(Err(err)) => compare.message = Some(format!("Could not show the difference: {}", err.message()).into()),
+                    Err(err) => compare.message = Some(err.into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
     }
 
     // ── searching inside open files ────────────────────────────────────────
@@ -486,6 +551,7 @@ impl Workspace {
     }
 
     fn activate(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        self.compare = None;
         self.active = Some(id);
         if let Some(ix) = self.index_of(id) {
             if self.tabs[ix].is_live() {
@@ -1142,6 +1208,13 @@ impl Workspace {
         }
     }
 
+    /// Compares the open file with the one viewed just before it.
+    fn on_compare_previous(&mut self, _: &CompareWithPrevious, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(&previous) = self.recent.iter().find(|&&id| Some(id) != self.active) {
+            self.compare_with(previous, cx);
+        }
+    }
+
     fn on_toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_open = !self.sidebar_open;
         cx.notify();
@@ -1251,7 +1324,14 @@ impl Workspace {
                     .rounded(px(10.))
                     .when(selected, |row| row.bg(selected_bg).text_color(selected_fg))
                     .when(!selected, |row| row.hover(move |style| style.bg(hover_bg)))
-                    .on_click(cx.listener(move |this, _, window, cx| this.open_from_sidebar(id, window, cx)))
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        if event.modifiers().alt {
+                            this.compare_with(id, cx); // ⌥-click: compare with the open file
+                        } else {
+                            this.compare = None;
+                            this.open_from_sidebar(id, window, cx);
+                        }
+                    }))
                     .child(div().pr_5().text_sm().font_weight(FontWeight::SEMIBOLD).truncate().child(title))
                     .child(
                         h_flex()
@@ -1353,7 +1433,11 @@ impl Workspace {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
         let tab = self.active_tab();
-        let title = tab.map(|t| t.title.clone()).unwrap_or_else(|| "Leaf".into());
+        let title = match &self.compare {
+            Some(compare) => compare.title.clone(),
+            None => tab.map(|t| t.title.clone()).unwrap_or_else(|| "Leaf".into()),
+        };
+        let comparing = self.compare.is_some();
         // Short like Notes' "92 notes": folder name plus file facts. The full
         // path is in the window title tooltip and the sidebar row.
         let subtitle = tab.map(|t| t.folder()).unwrap_or_else(|| format!("{} open", self.tabs.len()));
@@ -1413,7 +1497,22 @@ impl Workspace {
                         .on_click(cx.listener(|this, _, window, cx| this.on_new_note(&NewNote, window, cx))),
                 ),
             )
-            .when(tab.is_some_and(|t| t.is_live()), |bar| {
+            .when(comparing, |bar| {
+                bar.child(
+                    h_flex().flex_none().p_0p5().rounded_full().bg(capsule_bg).child(
+                        Button::new("end-compare")
+                            .ghost()
+                            .icon(IconName::Check)
+                            .label("Done")
+                            .tooltip("Close the comparison")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.compare = None;
+                                cx.notify();
+                            })),
+                    ),
+                )
+            })
+            .when(!comparing && tab.is_some_and(|t| t.is_live()), |bar| {
                 bar.child(
                     // Grouped in a capsule, like Notes' toolbar buttons.
                     h_flex()
@@ -1440,6 +1539,13 @@ impl Workspace {
         let centered = |text: SharedString| {
             div().size_full().flex().items_center().justify_center().text_color(muted).child(text).into_any_element()
         };
+        if let Some(compare) = &self.compare {
+            return match (&compare.state, &compare.message) {
+                (Some(state), _) => Diff::new(state).line_number(true).syntax_highlight(true).soft_wrap(true).size_full().into_any_element(),
+                (None, Some(message)) => centered(message.clone()),
+                (None, None) => div().into_any_element(),
+            };
+        }
         let Some(tab) = self.active_tab() else {
             return v_flex()
                 .size_full()
@@ -1550,6 +1656,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_prev))
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_new_note))
+            .on_action(cx.listener(Self::on_compare_previous))
             .on_action(cx.listener(Self::on_focus_search))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.open_paths(paths.paths().to_vec(), cx);

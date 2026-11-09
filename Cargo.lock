@@ -3419,6 +3419,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "similar",
  "syntect",
  "two-face",
 ]
