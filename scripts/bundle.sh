@@ -5,6 +5,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 PROFILE=${PROFILE:-release}
+# Keep the builder's home folder and checkout path out of the binary (panic
+# messages embed source paths). The last matching prefix wins.
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=~ --remap-path-prefix=$PWD=leaf"
 if [[ $PROFILE == release ]]; then cargo build --release; BIN=target/release/leaf
 else cargo build; BIN=target/debug/leaf; fi
 
