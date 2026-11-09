@@ -331,14 +331,11 @@ impl Workspace {
                 });
                 self.tabs[ix].state = TabState::Editing { editor, doc, _changes: changes };
             }
-            TabState::Editing { editor, doc, .. } => {
+            TabState::Editing { editor, .. } => {
                 let top = editor.read(cx).cursor_position().line as usize;
-                let doc = if self.tabs[ix].dirty {
-                    let text = editor.read(cx).text().to_string();
-                    Arc::new(Document::new(Bytes::Owned(text.into_bytes()), false))
-                } else {
-                    doc.clone()
-                };
+                // Rebuild from the editor even when clean: edits may already be saved.
+                let text = editor.read(cx).text().to_string();
+                let doc = Arc::new(Document::new(Bytes::Owned(text.into_bytes()), false));
                 self.tabs[ix].state = self.viewing(ix, doc, top.saturating_sub(5), cx);
                 self.focus_tab(ix, window, cx);
             }
