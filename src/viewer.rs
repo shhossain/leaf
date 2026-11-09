@@ -330,7 +330,10 @@ impl Viewer {
     /// reader was at the bottom, the view follows the new lines, like `tail -f`.
     pub fn replace_doc(&mut self, doc: Arc<Document>, cx: &mut Context<Self>) {
         let old_lines = self.doc.line_count();
-        let at_bottom = self.top_line() as f32 + self.page_rows() + 2. >= old_lines as f32;
+        let at_bottom = {
+            let handle = self.scroll.0.borrow().base_handle.clone();
+            -handle.offset().y + self.row_height >= handle.max_offset().y
+        };
         self.doc = doc;
         // Highlighting before the old last chunk is still right; redo the rest.
         let last_chunk = (old_lines - 1) / CHUNK;
