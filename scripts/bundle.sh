@@ -11,6 +11,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/leaf"
 cp assets/Info.plist "$APP/Contents/Info.plist"
+cp assets/Leaf.icns "$APP/Contents/Resources/Leaf.icns"   # regenerate: scripts/make-icon.swift + iconutil
 codesign --force --sign - "$APP" >/dev/null   # ad-hoc signature for local use
 # Tell Launch Services about the app so Finder lists it under "Open With".
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP"

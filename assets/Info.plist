@@ -11,6 +11,7 @@
 	<key>CFBundleVersion</key><string>1</string>
 	<key>LSMinimumSystemVersion</key><string>12.0</string>
 	<key>NSHighResolutionCapable</key><true/>
+	<key>CFBundleIconFile</key><string>Leaf</string>
 	<key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
 	<key>CFBundleDocumentTypes</key>
 	<array>
@@ -31,6 +32,9 @@
 				<string>public.xml</string>
 				<string>public.yaml</string>
 				<string>public.log</string>
+				<string>com.apple.log</string>
+				<string>public.markdown</string>
+				<string>public.toml</string>
 				<string>public.comma-separated-values-text</string>
 				<string>net.daringfireball.markdown</string>
 			</array>
