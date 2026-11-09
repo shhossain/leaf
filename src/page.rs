@@ -102,9 +102,21 @@ impl Viewer {
     /// Scrolls the page to the text of source `line`.
     pub(super) fn reveal_in_page(&mut self, line: usize, cx: &mut Context<Self>) -> bool {
         let Some((text, state)) = self.page_state.clone() else { return false };
-        let page_line = self.source_line_to_page(line);
-        let offset = text.split('\n').take(page_line).map(|l| l.len() + 1).sum::<usize>().min(text.len());
-        state.update(cx, |state, cx| state.reveal_range(offset..offset, cx)).is_ok()
+        // The page scrolls by rendered text; map the source line (or the next
+        // line with text) to its rendered range.
+        let mut offset = 0;
+        let mut target = None;
+        for (ix, l) in text.split('\n').enumerate() {
+            if ix >= self.source_line_to_page(line) && !l.trim().is_empty() {
+                target = Some(offset..offset + l.len());
+                break;
+            }
+            offset += l.len() + 1;
+        }
+        let Some(source) = target else { return false };
+        let rendered = state.read(cx).rendered_text();
+        let Some(range) = rendered.range_for_source(source) else { return false };
+        state.update(cx, |state, cx| state.reveal_range(range.start..range.start, cx)).is_ok()
     }
 
     /// After a double-click on the page: edit at the paragraph that was clicked.

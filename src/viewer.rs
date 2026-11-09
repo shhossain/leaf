@@ -321,13 +321,17 @@ pub struct Viewer {
     wrap: bool,
     /// Plain files (logs): tint ERROR / WARN / DEBUG lines.
     log_levels: bool,
+    /// A line to show in the page once it has rendered: (line, tries).
+    pending_page_line: Option<(usize, u8)>,
     /// (document, words) for the toolbar's word count.
     word_cache: std::cell::Cell<Option<(usize, usize)>>,
 }
 
 impl Viewer {
     pub fn new(doc: Arc<Document>, path: &Path, cx: &mut Context<Self>) -> Self {
-        let syntax = (doc.len() <= highlight::MAX_HIGHLIGHT_BYTES)
+        // Logs get level colors (ERROR, WARN…) instead of syntax colors.
+        let is_log = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("log"));
+        let syntax = (doc.len() <= highlight::MAX_HIGHLIGHT_BYTES && !is_log)
             .then(|| highlight::find_syntax(path, &doc.text(doc.line_range(0))))
             .flatten();
         let log_levels = syntax.is_none() && rich_kind(path).is_none();
@@ -367,6 +371,7 @@ impl Viewer {
             wrap: false,
             log_levels,
             word_cache: std::cell::Cell::new(None),
+            pending_page_line: None,
         };
         if this.rich == Some(RichKind::Markdown) {
             this.board = BoardState::detect(&this.doc);
@@ -644,6 +649,9 @@ impl Viewer {
     }
 
     pub fn scroll_to_line(&mut self, line: usize, cx: &mut Context<Self>) {
+        if self.preview.is_some() {
+            self.pending_page_line = Some((line, 0));
+        }
         self.pending_scroll = Some((line, false));
         cx.notify();
     }
@@ -957,7 +965,10 @@ impl Viewer {
 
     /// Shows `line` (0-based): scrolls the line view, or the rendered page.
     pub fn go_to_line(&mut self, line: usize, cx: &mut Context<Self>) {
-        if self.preview.is_some() && self.reveal_in_page(line, cx) {
+        if self.preview.is_some() {
+            if !self.reveal_in_page(line, cx) {
+                self.pending_page_line = Some((line, 0)); // once the page has rendered
+            }
             return;
         }
         self.flash_line = Some(line);
@@ -1338,6 +1349,13 @@ impl Render for Viewer {
         self.apply_pending_scroll(window, cx);
         let showing_board = self.board.as_ref().is_some_and(|b| b.visible);
         let page = self.preview.clone().filter(|_| !showing_board).map(|text| self.page_state(&text, cx));
+        if let Some((line, tries)) = self.pending_page_line.take() {
+            // The page parses in the background; try again on later frames.
+            if !self.reveal_in_page(line, cx) && tries < 30 {
+                self.pending_page_line = Some((line, tries + 1));
+                cx.on_next_frame(window, |_, _, cx| cx.notify());
+            }
+        }
         let theme = cx.theme();
         let (muted, border) = (theme.muted_foreground, theme.border);
 
