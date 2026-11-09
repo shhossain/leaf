@@ -17,7 +17,8 @@ Leaf exists because CotEditor slows down with many files open, and TextEdit is n
 - **Pages.** Markdown renders as a page and `.txt` reads as wrapped prose. Minified JSON opens formatted, and CSV/TSV files open as a table. ⇧⌘V switches to the raw lines.
 - **Notes.** ⌘N (or ⌘T) creates a Markdown note in `~/Documents/Leaf Notes`. Notes save as you type and take their name from the first line.
 - **Encodings.** Shift_JIS, Windows-1252, UTF-16 and others are detected, and saving keeps the original encoding, BOM and line endings.
-- **Search open files.** The sidebar search (⇧⌘F) matches file names and the text inside every open file, and shows the matching line. Opening a result jumps to it.
+- **Watched folders.** Add a folder to the sidebar (⇧⌘O, the **+ Folder** button, or drop a folder on the window) and its text files are listed like a Notes folder, newest first, with subfolders up to four levels deep. Hidden files, build folders such as `node_modules` and `target`, and binary files are left out. The folder is re-listed every 3 seconds while it is shown, and nothing is read until you open a file. Browsing a folder doesn't add its files to Open Files.
+- **Search.** The sidebar search (⇧⌘F) matches file names and the text inside every open file, or every file in the folder being shown, and shows the matching line. Opening a result jumps to it.
 - **Compare.** ⇧⌘D compares the current file with the one you viewed before it, side by side. ⌥-click a file in the sidebar to compare with that one.
 - **Safe saving.** Saves go to a temporary file that is renamed over the original, so a crash never leaves half a file. Leaf checks the file on disk before every save and will not overwrite changes made by another program without asking.
 - **Recovery.** Unsaved edits are copied to `~/Library/Application Support/Leaf/Recovery` while you type. After a crash or a forced quit they come back the next time you open the file.
@@ -83,20 +84,21 @@ The script prints the previous app for each type, so you can switch back the sam
 | Keys | Action |
 |---|---|
 | ⌘O | Open files |
+| ⇧⌘O | Add a folder to the sidebar |
 | ⌘N, ⌘T | New note |
 | ⌘E, double-click | Edit / Done |
 | ⌘S | Save |
 | ⌘W | Close file |
 | ⇧⌘T | Reopen closed file |
 | ⌃Tab, ⇧⌃Tab, ⌥⌘→, ⌥⌘← | Next / previous file |
-| ⌘1 … ⌘8, ⌘9 | Go to that file in the sidebar, last file |
+| ⌘1 … ⌘8, ⌘9 | Go to that row in the sidebar, last row |
 | ⌘F, ⌘G, ⇧⌘G | Find, next, previous match |
 | ⌘L | Go to line |
 | ⇧⌘L | Filter lines |
 | ⇧⌘V | Page, table or formatted view / raw lines |
 | ⇧⌘D, ⌥-click | Compare with the previous file / with that file |
 | ⌘B, ⌥⌘S | Show or hide the sidebar |
-| ⇧⌘F, ⌥⌘F | Search open files |
+| ⇧⌘F, ⌥⌘F | Search the sidebar |
 | Space, ⇧Space | Page down / up |
 | ⌘↑, ⌘↓ | Top / bottom |
 | Esc | Close the find or filter bar |
@@ -116,6 +118,7 @@ The viewer does not use a text editor widget. It keeps the file's bytes plus the
 | `src/highlight.rs` | Highlighting worker thread with checkpoints |
 | `src/encoding.rs` | Encoding detection and round-trip on save |
 | `src/file_list.rs` | Sidebar dates, preview lines, content search |
+| `src/folders.rs` | Listing watched folders |
 | `src/recovery.rs` | Copies of unsaved edits |
 | `src/notes.rs` | Notes folder, auto-naming |
 | `src/style.rs` | Colors |
@@ -130,7 +133,8 @@ Run the tests with `cargo test`.
 - Double-clicking a rendered Markdown page opens the editor at the top of the file, not at the paragraph you clicked.
 - UTF-16 files without a byte-order mark are treated as binary.
 - A file in an encoding that does not convert back exactly opens view-only.
-- Search in open files skips files over 16 MB (it still matches their names).
+- Search skips files over 16 MB (it still matches their names).
+- A watched folder lists at most 5,000 files.
 - Quitting from the Dock skips the unsaved-changes prompt; edits are kept as recovery copies instead.
 
 ## Releases

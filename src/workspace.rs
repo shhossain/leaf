@@ -6,8 +6,8 @@
 //! [`Viewer`]; ⌘E swaps in the full editor for that tab only. At most
 //! `MAX_LIVE` tabs stay in memory; older clean ones fall back to `Cold`.
 
-use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -26,12 +26,12 @@ use gpui_kit::*;
 use crate::doc::{self, DiskStamp, Loaded};
 use crate::encoding::{self, TextFormat};
 use crate::file_list::{self, FileMeta};
-use crate::{notes, recovery, style};
+use crate::{folders, notes, recovery, style};
 use crate::session::{self, Session, SessionTab};
 use crate::text_index::{Bytes, Document};
 use crate::viewer::{RichKind, Viewer};
 use crate::{
-    CloseTab, CompareWithPrevious, FocusSearch, NewNote, NextTab, OpenFile, PrevTab, Quit, ReopenClosed, Save, SelectTab, ToggleEdit,
+    AddFolder, CloseTab, CompareWithPrevious, FocusSearch, NewNote, NextTab, OpenFile, PrevTab, Quit, ReopenClosed, Save, SelectTab, ToggleEdit,
     ToggleSidebar,
 };
 
@@ -75,6 +75,7 @@ fn display_title(path: &std::path::Path, note: bool) -> String {
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-o", OpenFile, None),
+        KeyBinding::new("cmd-shift-o", AddFolder, None),
         KeyBinding::new("cmd-n", NewNote, None),
         KeyBinding::new("cmd-e", ToggleEdit, Some("Workspace")),
         KeyBinding::new("cmd-s", Save, Some("Workspace")),
@@ -151,6 +152,9 @@ struct DocTab {
     recovery_task: Option<Task<()>>,
     /// Find this text once the file has loaded (opened from a content search).
     pending_find: Option<String>,
+    /// Opened by browsing a watched folder: listed there, not under Open
+    /// Files, and not kept in the session.
+    in_folder: bool,
 }
 
 impl DocTab {
@@ -173,6 +177,7 @@ impl DocTab {
             autosave: None,
             recovery_task: None,
             pending_find: None,
+            in_folder: false,
         }
     }
 
@@ -229,7 +234,68 @@ enum WriteError {
 #[derive(Clone, PartialEq)]
 enum SidebarItem {
     Header { label: SharedString, first: bool },
+    /// An open file (index into `tabs`).
     File { ix: usize, separator: bool },
+    /// A file in the watched folder being shown.
+    Entry { folder: usize, entry: usize, separator: bool },
+}
+
+/// A folder shown in the sidebar like a Notes folder.
+struct WatchedFolder {
+    root: PathBuf,
+    name: SharedString,
+    /// Newest first. Binary files stay here (so they aren't peeked again) but aren't shown.
+    entries: Vec<FolderEntry>,
+    /// The folder has more than `folders::MAX_FILES` files.
+    truncated: bool,
+    scanning: bool,
+}
+
+/// A file inside a watched folder. Not a tab (nothing is loaded) until opened.
+struct FolderEntry {
+    path: PathBuf,
+    title: SharedString,
+    subfolder: String,
+    modified: Option<SystemTime>,
+    len: u64,
+    meta: Option<FileMeta>,
+    peeking: bool,
+}
+
+/// Builds date-grouped sidebar rows with Notes-style separators.
+struct RowGrouper {
+    now: chrono::DateTime<chrono::Local>,
+    items: Vec<SidebarItem>,
+    group: Option<String>,
+    previous_selected: Option<bool>,
+}
+
+impl RowGrouper {
+    fn new() -> Self {
+        Self { now: chrono::Local::now(), items: Vec::new(), group: None, previous_selected: None }
+    }
+
+    fn push(&mut self, modified: Option<SystemTime>, selected: bool, item: impl FnOnce(bool) -> SidebarItem) {
+        let group = modified.map(|m| file_list::group_label(file_list::local(m), self.now)).unwrap_or_else(|| "Today".into());
+        if self.group.as_ref() != Some(&group) {
+            self.items.push(SidebarItem::Header { label: group.clone().into(), first: self.group.is_none() });
+            self.group = Some(group);
+            self.previous_selected = None;
+        }
+        // Thin inset lines between rows, hidden next to the highlighted one (like Notes).
+        let separator = self.previous_selected == Some(false) && !selected;
+        self.previous_selected = Some(selected);
+        self.items.push(item(separator));
+    }
+}
+
+/// What a sidebar row shows.
+struct Row {
+    title: String,
+    date: String,
+    snippet: String,
+    folder: String,
+    selected: bool,
 }
 
 pub struct Workspace {
@@ -244,8 +310,11 @@ pub struct Workspace {
     sidebar_open: bool,
     /// Two files shown side by side (⌥-click a file in the sidebar).
     compare: Option<Compare>,
-    /// Sidebar search inside files: tab id → first matching line, for `content_query`.
-    content_hits: std::collections::HashMap<u64, String>,
+    /// Watched folders, and which one the sidebar shows (`None`: open files).
+    folders: Vec<WatchedFolder>,
+    scope: Option<usize>,
+    /// Sidebar search inside files: path → first matching line, for `content_query`.
+    content_hits: HashMap<PathBuf, String>,
     content_query: String,
     _content_search: Option<Task<()>>,
     /// Re-checks the visible file on disk (live reload, log tailing).
@@ -271,22 +340,33 @@ impl Workspace {
                 if let Some(id) = this.active {
                     this.check_disk(id, window, cx);
                 }
+                if let Some(scope) = this.scope {
+                    this.rescan(scope, cx);
+                }
             }
         })
         .detach();
         // Live reload and log tailing: one `stat` of the visible file every
         // second while active, every 3 s in the background (watching a log in
         // a side window is a main use). No file watchers, no per-file timers.
-        let disk_poll = cx.spawn_in(window, async move |this, cx| loop {
-            let active = this.update_in(cx, |_, window, _| window.is_window_active()).unwrap_or(false);
-            cx.background_executor().timer(Duration::from_secs(if active { 1 } else { 3 })).await;
-            let alive = this.update_in(cx, |this, window, cx| {
-                if let Some(id) = this.active {
-                    this.check_disk(id, window, cx);
+        // The watched folder on show is re-listed every 3 s while active.
+        let disk_poll = cx.spawn_in(window, async move |this, cx| {
+            let mut tick: u32 = 0;
+            loop {
+                let active = this.update_in(cx, |_, window, _| window.is_window_active()).unwrap_or(false);
+                cx.background_executor().timer(Duration::from_secs(if active { 1 } else { 3 })).await;
+                tick = tick.wrapping_add(1);
+                let alive = this.update_in(cx, |this, window, cx| {
+                    if let Some(id) = this.active {
+                        this.check_disk(id, window, cx);
+                    }
+                    if let Some(scope) = this.scope.filter(|_| active && tick % 3 == 0) {
+                        this.rescan(scope, cx);
+                    }
+                });
+                if alive.is_err() {
+                    break;
                 }
-            });
-            if alive.is_err() {
-                break;
             }
         });
         let weak = cx.entity().downgrade();
@@ -307,7 +387,7 @@ impl Workspace {
             async {}
         })
         .detach();
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search open files"));
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let search_events = cx.subscribe(&search, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.search_contents(cx);
@@ -323,6 +403,8 @@ impl Workspace {
             focus,
             sidebar_open: true,
             compare: None,
+            folders: Vec::new(),
+            scope: None,
             content_hits: Default::default(),
             content_query: String::new(),
             _content_search: None,
@@ -343,10 +425,14 @@ impl Workspace {
         for path in paths {
             let path = std::fs::canonicalize(&path).unwrap_or(path);
             if path.is_dir() {
+                self.watch_folder(path, cx);
                 continue;
             }
-            let id = match self.tabs.iter().find(|t| t.path == path) {
-                Some(tab) => tab.id,
+            let id = match self.tabs.iter_mut().find(|t| t.path == path) {
+                Some(tab) => {
+                    tab.in_folder = false;
+                    tab.id
+                }
                 None => self.push_tab(path),
             };
             first.get_or_insert(id);
@@ -463,7 +549,10 @@ impl Workspace {
             return;
         }
         let Some(matcher) = crate::viewer::build_matcher(&query) else { return };
-        let targets: Vec<(u64, PathBuf)> = self.tabs.iter().map(|t| (t.id, t.path.clone())).collect();
+        let targets: Vec<PathBuf> = match self.scope.and_then(|s| self.folders.get(s)) {
+            Some(folder) => folder.entries.iter().filter(|e| !e.meta.as_ref().is_some_and(|m| m.binary)).map(|e| e.path.clone()).collect(),
+            None => self.tabs.iter().filter(|t| !t.in_folder).map(|t| t.path.clone()).collect(),
+        };
         self._content_search = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(200)).await;
             let hits = cx
@@ -471,8 +560,8 @@ impl Workspace {
                 .spawn(async move {
                     targets
                         .into_iter()
-                        .filter_map(|(id, path)| file_list::find_in_file(&path, &matcher).map(|line| (id, line)))
-                        .collect::<std::collections::HashMap<_, _>>()
+                        .filter_map(|path| file_list::find_in_file(&path, &matcher).map(|line| (path, line)))
+                        .collect::<HashMap<_, _>>()
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -483,25 +572,201 @@ impl Workspace {
         }));
     }
 
-    /// The line inside `id` that matched the current sidebar search, if any.
-    fn content_hit(&self, id: u64, cx: &App) -> Option<&String> {
-        (self.content_query == self.search.read(cx).value().as_ref()).then(|| self.content_hits.get(&id)).flatten()
+    /// The line inside `path` that matched the current sidebar search, if any.
+    fn content_hit(&self, path: &Path, cx: &App) -> Option<&String> {
+        (self.content_query == self.search.read(cx).value().as_ref()).then(|| self.content_hits.get(path)).flatten()
     }
 
     /// Opens a file from the sidebar; if it matched a content search, the
     /// find bar opens on that text.
     fn open_from_sidebar(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         self.activate(id, window, cx);
-        if self.content_hit(id, cx).is_none() {
+        let Some(ix) = self.index_of(id) else { return };
+        if self.content_hit(&self.tabs[ix].path, cx).is_none() {
             return;
         }
         let query = self.content_query.clone();
-        let Some(ix) = self.index_of(id) else { return };
         match &self.tabs[ix].state {
             TabState::Viewing { viewer, .. } => {
                 viewer.clone().update(cx, |viewer, cx| viewer.find_text(&query, window, cx));
             }
             _ => self.tabs[ix].pending_find = Some(query),
+        }
+    }
+
+    // ── watched folders ────────────────────────────────────────────────────
+
+    /// Adds a folder to the sidebar, or shows it if it is already there.
+    pub fn watch_folder(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        let ix = self.add_folder(root);
+        self.show_scope(Some(ix), cx);
+    }
+
+    fn add_folder(&mut self, root: PathBuf) -> usize {
+        if let Some(ix) = self.folders.iter().position(|f| f.root == root) {
+            return ix;
+        }
+        let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| root.display().to_string());
+        self.folders.push(WatchedFolder { root, name: name.into(), entries: Vec::new(), truncated: false, scanning: false });
+        self.folders.len() - 1
+    }
+
+    /// Shows open files (`None`) or a watched folder in the sidebar.
+    fn show_scope(&mut self, scope: Option<usize>, cx: &mut Context<Self>) {
+        self.scope = scope.filter(|&s| s < self.folders.len());
+        if let Some(scope) = self.scope {
+            self.rescan(scope, cx);
+        }
+        self.search_contents(cx); // the search now covers other files
+        self.schedule_session_save(cx);
+        cx.notify();
+    }
+
+    fn unwatch_folder(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix >= self.folders.len() {
+            return;
+        }
+        let root = self.folders.remove(ix).root;
+        let active = self.active;
+        let dropped: Vec<u64> = self
+            .tabs
+            .iter()
+            .filter(|t| t.in_folder && t.path.starts_with(&root) && !t.dirty && Some(t.id) != active)
+            .map(|t| t.id)
+            .collect();
+        self.tabs.retain(|t| !dropped.contains(&t.id));
+        self.recent.retain(|id| !dropped.contains(id));
+        for tab in self.tabs.iter_mut().filter(|t| t.in_folder && t.path.starts_with(&root)) {
+            tab.in_folder = false;
+        }
+        self.scope = match self.scope {
+            Some(s) if s == ix => None,
+            Some(s) if s > ix => Some(s - 1),
+            other => other,
+        };
+        self.search_contents(cx);
+        self.schedule_session_save(cx);
+        cx.notify();
+    }
+
+    /// Lists a folder again in the background. Files that didn't change keep
+    /// their preview, so only new or changed files are peeked.
+    fn rescan(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(folder) = self.folders.get_mut(ix) else { return };
+        if folder.scanning {
+            return;
+        }
+        folder.scanning = true;
+        let root = folder.root.clone();
+        cx.spawn(async move |this, cx| {
+            let scan = cx.background_executor().spawn({
+                let root = root.clone();
+                async move { folders::scan(&root) }
+            });
+            let scan = scan.await;
+            this.update(cx, |this, cx| {
+                if let Some(ix) = this.folders.iter().position(|f| f.root == root) {
+                    this.merge_scan(ix, scan, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn merge_scan(&mut self, ix: usize, scan: folders::Scan, cx: &mut Context<Self>) {
+        let folder = &mut self.folders[ix];
+        folder.scanning = false;
+        let mut old: HashMap<PathBuf, FolderEntry> = folder.entries.drain(..).map(|e| (e.path.clone(), e)).collect();
+        let mut changed = folder.truncated != scan.truncated;
+        folder.truncated = scan.truncated;
+        for file in scan.files {
+            let entry = match old.remove(&file.path) {
+                Some(entry) if entry.modified == file.modified && entry.len == file.len => entry,
+                _ => {
+                    changed = true;
+                    FolderEntry {
+                        title: file.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default().into(),
+                        subfolder: folders::subfolder(&folder.root, &file.path),
+                        path: file.path,
+                        modified: file.modified,
+                        len: file.len,
+                        meta: None,
+                        peeking: false,
+                    }
+                }
+            };
+            folder.entries.push(entry);
+        }
+        changed |= !old.is_empty(); // files were deleted
+        folder.entries.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.path.cmp(&b.path)));
+        if changed {
+            self.peek_folder(ix, cx);
+            cx.notify();
+        }
+    }
+
+    /// Reads previews for folder files that don't have one yet.
+    fn peek_folder(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(folder) = self.folders.get_mut(ix) else { return };
+        let root = folder.root.clone();
+        let todo: Vec<PathBuf> = folder
+            .entries
+            .iter_mut()
+            .filter(|e| e.meta.is_none() && !e.peeking)
+            .map(|e| {
+                e.peeking = true;
+                e.path.clone()
+            })
+            .collect();
+        if todo.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let metas = cx
+                .background_executor()
+                .spawn(async move { todo.into_iter().map(|path| (file_list::peek(&path), path)).collect::<Vec<_>>() })
+                .await;
+            this.update(cx, |this, cx| {
+                let Some(folder) = this.folders.iter_mut().find(|f| f.root == root) else { return };
+                let mut metas: HashMap<PathBuf, FileMeta> = metas.into_iter().map(|(meta, path)| (path, meta)).collect();
+                for entry in &mut folder.entries {
+                    if let Some(meta) = metas.remove(&entry.path) {
+                        (entry.meta, entry.peeking) = (Some(meta), false);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The tab for `path`, created (cold, nothing read) if it isn't open.
+    fn tab_for(&mut self, path: PathBuf, cx: &mut Context<Self>) -> u64 {
+        match self.tabs.iter().find(|t| t.path == path) {
+            Some(tab) => tab.id,
+            None => {
+                let id = self.push_tab(path);
+                self.tabs.last_mut().expect("just pushed").in_folder = true;
+                self.peek_missing(cx);
+                id
+            }
+        }
+    }
+
+    /// Opens a watched folder's file; with `compare`, compares it with the open file instead.
+    fn open_entry(&mut self, folder: usize, entry: usize, compare: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.folders.get(folder).and_then(|f| f.entries.get(entry)).map(|e| e.path.clone()) else {
+            return;
+        };
+        let id = self.tab_for(path, cx);
+        if compare {
+            self.compare_with(id, cx);
+        } else {
+            self.compare = None;
+            self.open_from_sidebar(id, window, cx);
         }
     }
 
@@ -520,18 +785,28 @@ impl Workspace {
             }
         }
         self.active = active.or(self.tabs.first().map(|t| t.id));
+        for root in session.folders.into_iter().filter(|root| root.is_dir()) {
+            self.add_folder(root);
+        }
+        self.scope = session.scope.filter(|&s| s < self.folders.len());
+        if let Some(scope) = self.scope {
+            self.rescan(scope, cx);
+        }
+        if let Some(path) = session.folder_file.filter(|p| p.is_file()) {
+            self.active = Some(self.tab_for(path, cx));
+        }
         self.peek_missing(cx);
         cx.notify();
     }
 
     fn session(&self, cx: &App) -> Session {
+        let kept: Vec<&DocTab> = self.tabs.iter().filter(|t| !t.in_folder).collect();
         Session {
-            tabs: self
-                .tabs
-                .iter()
-                .map(|t| SessionTab { path: t.path.clone(), top_line: t.current_line(cx) })
-                .collect(),
-            active: self.active_index(),
+            tabs: kept.iter().map(|t| SessionTab { path: t.path.clone(), top_line: t.current_line(cx) }).collect(),
+            active: kept.iter().position(|t| Some(t.id) == self.active),
+            folders: self.folders.iter().map(|f| f.root.clone()).collect(),
+            scope: self.scope,
+            folder_file: self.active_tab().filter(|t| t.in_folder).map(|t| t.path.clone()),
         }
     }
 
@@ -1137,14 +1412,43 @@ impl Workspace {
         false
     }
 
+    /// The file rows the sidebar shows right now, top to bottom.
+    fn sidebar_rows(&self, cx: &App) -> Vec<SidebarItem> {
+        self.sidebar_items(cx).into_iter().filter(|item| !matches!(item, SidebarItem::Header { .. })).collect()
+    }
+
+    fn is_active_row(&self, item: &SidebarItem) -> bool {
+        match *item {
+            SidebarItem::File { ix, .. } => self.active_index() == Some(ix),
+            SidebarItem::Entry { folder, entry, .. } => {
+                let path = self.folders.get(folder).and_then(|f| f.entries.get(entry)).map(|e| &e.path);
+                path.is_some() && self.active_tab().map(|t| &t.path) == path
+            }
+            SidebarItem::Header { .. } => false,
+        }
+    }
+
+    fn activate_row(&mut self, item: &SidebarItem, window: &mut Window, cx: &mut Context<Self>) {
+        match *item {
+            SidebarItem::File { ix, .. } => self.activate_index(ix, window, cx),
+            SidebarItem::Entry { folder, entry, .. } => self.open_entry(folder, entry, false, window, cx),
+            SidebarItem::Header { .. } => {}
+        }
+    }
+
+    /// Next / previous file in sidebar order.
     fn cycle(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let order = self.display_order();
-        let n = order.len() as isize;
+        let rows = self.sidebar_rows(cx);
+        let n = rows.len() as isize;
         if n == 0 {
             return;
         }
-        let pos = self.active_index().and_then(|a| order.iter().position(|&o| o == a)).unwrap_or(0) as isize;
-        self.activate_index(order[(pos + delta).rem_euclid(n) as usize], window, cx);
+        let pos = match rows.iter().position(|row| self.is_active_row(row)) {
+            Some(pos) => pos as isize + delta,
+            None if delta > 0 => 0,
+            None => n - 1,
+        };
+        self.activate_row(&rows[pos.rem_euclid(n) as usize], window, cx);
     }
 
     // ── actions ────────────────────────────────────────────────────────────
@@ -1210,10 +1514,30 @@ impl Workspace {
     }
 
     fn on_select_tab(&mut self, action: &SelectTab, window: &mut Window, cx: &mut Context<Self>) {
-        let order = self.display_order();
-        if let Some(&ix) = order.get(action.0).or_else(|| (action.0 == usize::MAX).then(|| order.last()).flatten()) {
-            self.activate_index(ix, window, cx);
+        let rows = self.sidebar_rows(cx);
+        if let Some(row) = rows.get(action.0).or_else(|| (action.0 == usize::MAX).then(|| rows.last()).flatten()) {
+            self.activate_row(row, window, cx);
         }
+    }
+
+    fn on_add_folder(&mut self, _: &AddFolder, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: true,
+            prompt: Some("Add to Sidebar".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = picked.await {
+                this.update(cx, |this, cx| {
+                    for path in paths {
+                        this.watch_folder(path, cx);
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     fn on_new_note(&mut self, _: &NewNote, window: &mut Window, cx: &mut Context<Self>) {
@@ -1267,69 +1591,116 @@ impl Workspace {
     /// The sidebar's rows in display order: date-group headers and files,
     /// filtered by the search box. Cheap; recomputed every render.
     fn sidebar_items(&self, cx: &App) -> Vec<SidebarItem> {
-        let now = chrono::Local::now();
         let query = self.search.read(cx).value().to_lowercase();
-        let mut items = Vec::new();
-        let mut current_group: Option<String> = None;
-        let mut previous_selected: Option<bool> = None;
-        for ix in self.display_order() {
-            let tab = &self.tabs[ix];
-            if !query.is_empty() {
-                let snippet = tab.meta.as_ref().map(|m| m.snippet.as_str()).unwrap_or("");
-                let haystacks = [tab.title.as_ref(), tab.folder().as_str(), snippet].map(str::to_lowercase);
-                if !haystacks.iter().any(|s| s.contains(&query)) && self.content_hit(tab.id, cx).is_none() {
+        let matches = |title: &str, folder: &str, meta: Option<&FileMeta>, path: &Path| {
+            let snippet = meta.map(|m| m.snippet.as_str()).unwrap_or("");
+            query.is_empty()
+                || [title, folder, snippet].iter().any(|s| s.to_lowercase().contains(&query))
+                || self.content_hit(path, cx).is_some()
+        };
+        let mut rows = RowGrouper::new();
+        if let Some((f, folder)) = self.scope.and_then(|s| self.folders.get(s).map(|folder| (s, folder))) {
+            let active_path = self.active_tab().map(|t| t.path.as_path());
+            for (e, entry) in folder.entries.iter().enumerate() {
+                if entry.meta.as_ref().is_some_and(|m| m.binary)
+                    || !matches(&entry.title, &entry.subfolder, entry.meta.as_ref(), &entry.path)
+                {
                     continue;
                 }
+                let selected = active_path == Some(entry.path.as_path());
+                rows.push(entry.modified, selected, |separator| SidebarItem::Entry { folder: f, entry: e, separator });
             }
-            let group = tab
-                .modified()
-                .map(|m| file_list::group_label(file_list::local(m), now))
-                .unwrap_or_else(|| "Today".into());
-            if current_group.as_ref() != Some(&group) {
-                items.push(SidebarItem::Header { label: group.clone().into(), first: current_group.is_none() });
-                current_group = Some(group);
-                previous_selected = None;
-            }
-            let selected = Some(tab.id) == self.active;
-            // Thin inset lines between rows, hidden next to the highlighted one (like Notes).
-            let separator = previous_selected == Some(false) && !selected;
-            previous_selected = Some(selected);
-            items.push(SidebarItem::File { ix, separator });
+            return rows.items;
         }
-        items
+        for ix in self.display_order() {
+            let tab = &self.tabs[ix];
+            if tab.in_folder || !matches(&tab.title, &tab.folder(), tab.meta.as_ref(), &tab.path) {
+                continue;
+            }
+            rows.push(tab.modified(), Some(tab.id) == self.active, |separator| SidebarItem::File { ix, separator });
+        }
+        rows.items
     }
 
     fn render_sidebar_item(&self, item_ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let Some(item) = self.sidebar_items.get(item_ix).cloned() else { return div().into_any_element() };
-        let (ix, separator) = match item {
-            SidebarItem::Header { label, first } => {
-                return div()
-                    .w_full()
-                    .px_5()
-                    .pt(if first { px(6.) } else { px(16.) })
-                    .pb_1()
-                    .text_base()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(label)
-                    .into_any_element();
+        let now = chrono::Local::now();
+        let date = |modified: Option<SystemTime>| modified.map(|m| file_list::row_date(file_list::local(m), now)).unwrap_or_default();
+        match item {
+            SidebarItem::Header { label, first } => div()
+                .w_full()
+                .px_5()
+                .pt(if first { px(6.) } else { px(16.) })
+                .pb_1()
+                .text_base()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(label)
+                .into_any_element(),
+            SidebarItem::File { ix, separator } => {
+                let Some(tab) = self.tabs.get(ix) else { return div().into_any_element() };
+                let id = tab.id;
+                let row = Row {
+                    title: if tab.dirty { format!("● {}", tab.title) } else { tab.title.to_string() },
+                    date: date(tab.modified()),
+                    // During a content search, show the matching line instead of the first line.
+                    snippet: match self.content_hit(&tab.path, cx) {
+                        Some(line) => line.clone(),
+                        None => tab.meta.as_ref().map(|m| m.snippet.clone()).unwrap_or_default(),
+                    },
+                    folder: tab.folder(),
+                    selected: Some(id) == self.active,
+                };
+                let on_click = cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    if event.modifiers().alt {
+                        this.compare_with(id, cx); // ⌥-click: compare with the open file
+                    } else {
+                        this.compare = None;
+                        this.open_from_sidebar(id, window, cx);
+                    }
+                });
+                let on_close = cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.close_tab(id, window, cx);
+                });
+                self.render_row(("file", id as usize).into(), row, separator, on_click, Some(on_close), cx)
             }
-            SidebarItem::File { ix, separator } => (ix, separator),
-        };
-        let Some(tab) = self.tabs.get(ix) else { return div().into_any_element() };
+            SidebarItem::Entry { folder, entry, separator } => {
+                let Some(file) = self.folders.get(folder).and_then(|f| f.entries.get(entry)) else {
+                    return div().into_any_element();
+                };
+                let row = Row {
+                    title: file.title.to_string(),
+                    date: date(file.modified),
+                    snippet: match self.content_hit(&file.path, cx) {
+                        Some(line) => line.clone(),
+                        None => file.meta.as_ref().map(|m| m.snippet.clone()).unwrap_or_default(),
+                    },
+                    folder: file.subfolder.clone(),
+                    selected: self.active_tab().is_some_and(|t| t.path == file.path),
+                };
+                let on_click = cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    this.open_entry(folder, entry, event.modifiers().alt, window, cx);
+                });
+                self.render_row(("entry", entry).into(), row, separator, on_click, None::<fn(&ClickEvent, &mut Window, &mut App)>, cx)
+            }
+        }
+    }
+
+    /// One Notes-style row: title, date and first line, folder.
+    fn render_row(
+        &self,
+        id: ElementId,
+        row: Row,
+        separator: bool,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        on_close: Option<impl Fn(&ClickEvent, &mut Window, &mut App) + 'static>,
+        cx: &App,
+    ) -> AnyElement {
         let theme = cx.theme();
         let (muted, hover_bg, separator_color) = (theme.muted_foreground, theme.secondary, theme.border.opacity(0.45));
         let (selected_bg, selected_fg) = style::selection_row(theme.mode.is_dark());
-        let id = tab.id;
-        let selected = Some(id) == self.active;
         let row_group: SharedString = format!("row-{id}").into();
-        let sub_color = if selected { selected_fg.opacity(0.75) } else { muted };
-        let date = tab.modified().map(|m| file_list::row_date(file_list::local(m), chrono::Local::now())).unwrap_or_default();
-        // During a content search, show the matching line instead of the first line.
-        let snippet = match self.content_hit(id, cx) {
-            Some(line) => line.clone(),
-            None => tab.meta.as_ref().map(|m| m.snippet.clone()).unwrap_or_default(),
-        };
-        let title = if tab.dirty { format!("● {}", tab.title) } else { tab.title.to_string() };
+        let sub_color = if row.selected { selected_fg.opacity(0.75) } else { muted };
         // `list` doesn't stretch its items; give each one the full width.
         v_flex()
             .w_full()
@@ -1337,31 +1708,24 @@ impl Workspace {
             .child(div().mx_3().h(px(1.)).when(separator, |line| line.bg(separator_color)))
             .child(
                 v_flex()
-                    .id(("file", id as usize))
+                    .id(id.clone())
                     .group(row_group.clone())
                     .relative()
                     .gap_0p5()
                     .px_3()
                     .py(px(9.))
                     .rounded(px(10.))
-                    .when(selected, |row| row.bg(selected_bg).text_color(selected_fg))
-                    .when(!selected, |row| row.hover(move |style| style.bg(hover_bg)))
-                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                        if event.modifiers().alt {
-                            this.compare_with(id, cx); // ⌥-click: compare with the open file
-                        } else {
-                            this.compare = None;
-                            this.open_from_sidebar(id, window, cx);
-                        }
-                    }))
-                    .child(div().pr_5().text_sm().font_weight(FontWeight::SEMIBOLD).truncate().child(title))
+                    .when(row.selected, |el| el.bg(selected_bg).text_color(selected_fg))
+                    .when(!row.selected, |el| el.hover(move |style| style.bg(hover_bg)))
+                    .on_click(on_click)
+                    .child(div().pr_5().text_sm().font_weight(FontWeight::SEMIBOLD).truncate().child(row.title))
                     .child(
                         h_flex()
                             .gap_2()
                             .text_xs()
                             .min_w_0()
-                            .child(div().flex_none().child(date))
-                            .child(div().min_w_0().truncate().text_color(sub_color).child(snippet)),
+                            .when(!row.date.is_empty(), |el| el.child(div().flex_none().child(row.date)))
+                            .child(div().min_w_0().truncate().text_color(sub_color).child(row.snippet)),
                     )
                     .child(
                         h_flex()
@@ -1369,28 +1733,88 @@ impl Workspace {
                             .text_xs()
                             .text_color(sub_color)
                             .child(Icon::new(IconName::Folder).xsmall())
-                            .child(div().truncate().child(tab.folder())),
+                            .child(div().truncate().child(row.folder)),
                     )
-                    .child(
-                        div()
-                            .id(("close-file", id as usize))
-                            .absolute()
-                            .top_2()
-                            .right_2()
-                            .px_1()
-                            .rounded_sm()
-                            .text_xs()
-                            .invisible()
-                            .group_hover(row_group, |style| style.visible())
-                            .hover(move |style| style.bg(hover_bg))
-                            .child("✕")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.close_tab(id, window, cx);
-                            })),
-                    ),
+                    .when_some(on_close, |el, on_close| {
+                        el.child(
+                            div()
+                                .id(ElementId::NamedChild(Arc::new(id), "close".into()))
+                                .absolute()
+                                .top_2()
+                                .right_2()
+                                .px_1()
+                                .rounded_sm()
+                                .text_xs()
+                                .invisible()
+                                .group_hover(row_group, |style| style.visible())
+                                .hover(move |style| style.bg(hover_bg))
+                                .child("✕")
+                                .on_click(on_close),
+                        )
+                    }),
             )
             .into_any_element()
+    }
+
+    /// Pills under the search field: open files, each watched folder, and
+    /// a button to add one. The shown folder's pill can remove it.
+    fn render_scopes(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (selected_bg, selected_fg) = style::selection_row(theme.mode.is_dark());
+        let (pill_bg, hover_bg, muted) = (theme.secondary.opacity(0.6), theme.secondary, theme.muted_foreground);
+        let pill = move |id: ElementId, selected: bool| {
+            h_flex()
+                .id(id)
+                .flex_none()
+                .gap_1()
+                .h_6()
+                .px_2p5()
+                .rounded_full()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .when(selected, |el| el.bg(selected_bg).text_color(selected_fg))
+                .when(!selected, |el| el.bg(pill_bg).hover(move |style| style.bg(hover_bg)))
+        };
+        let open_count = format!("Open Files  {}", self.tabs.iter().filter(|t| !t.in_folder).count());
+        h_flex()
+            .id("scopes")
+            .px_3()
+            .pb_2()
+            .gap_1p5()
+            .overflow_x_scroll()
+            .child(
+                pill("scope-open".into(), self.scope.is_none())
+                    .child(open_count)
+                    .on_click(cx.listener(|this, _, _, cx| this.show_scope(None, cx))),
+            )
+            .children(self.folders.iter().enumerate().map(|(ix, folder)| {
+                let selected = self.scope == Some(ix);
+                pill(("scope", ix).into(), selected)
+                    .child(Icon::new(IconName::Folder).xsmall())
+                    .child(folder.name.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| this.show_scope(Some(ix), cx)))
+                    .when(selected, |el| {
+                        el.child(
+                            div()
+                                .id(("unwatch", ix))
+                                .px_0p5()
+                                .rounded_sm()
+                                .opacity(0.7)
+                                .hover(|style| style.opacity(1.))
+                                .child("✕")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.unwatch_folder(ix, cx);
+                                })),
+                        )
+                    })
+            }))
+            .child(
+                pill("scope-add".into(), false)
+                    .text_color(muted)
+                    .child("+ Folder")
+                    .on_click(cx.listener(|this, _, window, cx| this.on_add_folder(&AddFolder, window, cx))),
+            )
     }
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1407,6 +1831,14 @@ impl Workspace {
             (theme.muted_foreground, theme.sidebar, theme.sidebar_border, theme.input.opacity(0.55));
         let empty = self.sidebar_items.is_empty();
         let searching = !self.search.read(cx).value().is_empty();
+        let folder = self.scope.and_then(|s| self.folders.get(s));
+        let empty_text = match folder {
+            _ if searching => "No Matches",
+            Some(folder) if folder.scanning && folder.entries.is_empty() => "Loading…",
+            Some(_) => "No Text Files",
+            None => "No Open Files",
+        };
+        let truncated = folder.is_some_and(|f| f.truncated);
 
         v_flex()
             .w(px(SIDEBAR_WIDTH))
@@ -1436,10 +1868,12 @@ impl Workspace {
                     ),
                 ),
             )
-            .when(empty, |sidebar| {
-                let text = if searching { "No Matches" } else { "No Open Files" };
-                sidebar.child(div().pt_10().w_full().text_center().text_color(muted).child(text))
+            .child(self.render_scopes(cx))
+            .when(truncated, |sidebar| {
+                let text = format!("Showing the first {} files.", folders::MAX_FILES);
+                sidebar.child(div().px_5().pb_1().text_xs().text_color(muted).child(text))
             })
+            .when(empty, |sidebar| sidebar.child(div().pt_10().w_full().text_center().text_color(muted).child(empty_text)))
             .child(
                 list(
                     self.sidebar_list.clone(),
@@ -1462,7 +1896,7 @@ impl Workspace {
         let comparing = self.compare.is_some();
         // Short like Notes' "92 notes": folder name plus file facts. The full
         // path is in the window title tooltip and the sidebar row.
-        let subtitle = tab.map(|t| t.folder()).unwrap_or_else(|| format!("{} open", self.tabs.len()));
+        let subtitle = tab.map(|t| t.folder()).unwrap_or_else(|| format!("{} open", self.tabs.iter().filter(|t| !t.in_folder).count()));
         let editing = tab.is_some_and(|t| matches!(t.state, TabState::Editing { .. }));
         let viewer = tab.and_then(|t| match &t.state {
             TabState::Viewing { viewer, .. } => Some(viewer.clone()),
@@ -1669,6 +2103,7 @@ impl Render for Workspace {
             .size_full()
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(Self::on_open))
+            .on_action(cx.listener(Self::on_add_folder))
             .on_action(cx.listener(Self::on_reopen_closed))
             .on_action(cx.listener(Self::on_toggle_edit))
             .on_action(cx.listener(Self::on_save))

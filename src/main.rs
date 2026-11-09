@@ -6,6 +6,7 @@
 mod doc;
 mod encoding;
 mod file_list;
+mod folders;
 mod highlight;
 mod notes;
 mod recovery;
@@ -26,7 +27,7 @@ use workspace::Workspace;
 
 actions!(
     leaf,
-    [Quit, OpenFile, Save, CloseTab, ReopenClosed, ToggleEdit, NextTab, PrevTab, ToggleSidebar, FocusSearch, NewNote, CompareWithPrevious]
+    [Quit, OpenFile, Save, CloseTab, ReopenClosed, ToggleEdit, NextTab, PrevTab, ToggleSidebar, FocusSearch, NewNote, CompareWithPrevious, AddFolder]
 );
 
 /// ⌘1–⌘8 open the file at that position in the sidebar; ⌘9 opens the last
@@ -48,11 +49,7 @@ fn main() {
         }
     });
 
-    let cli_paths: Vec<PathBuf> = std::env::args_os()
-        .skip(1)
-        .filter(|arg| !arg.to_string_lossy().starts_with('-'))
-        .map(PathBuf::from)
-        .collect();
+    let cli_paths = cli_paths(std::env::args_os().skip(1));
 
     app.run(move |cx| {
         gpui_kit::init(cx);
@@ -133,6 +130,7 @@ fn menus() -> Vec<Menu> {
             items: vec![
                 MenuItem::action("New Note", NewNote),
                 MenuItem::action("Open…", OpenFile),
+                MenuItem::action("Add Folder to Sidebar…", AddFolder),
                 MenuItem::action("Save", Save),
                 MenuItem::separator(),
                 MenuItem::action("Close Tab", CloseTab),
@@ -146,7 +144,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Toggle Edit Mode", ToggleEdit),
                 MenuItem::action("Page / Source Lines", viewer::TogglePreview),
                 MenuItem::action("Show/Hide Sidebar", ToggleSidebar),
-                MenuItem::action("Search in Open Files", FocusSearch),
+                MenuItem::action("Search in Sidebar", FocusSearch),
                 MenuItem::separator(),
                 MenuItem::action("Compare with Previous File  (or ⌥-click a file)", CompareWithPrevious),
                 MenuItem::separator(),
@@ -156,6 +154,25 @@ fn menus() -> Vec<Menu> {
             disabled: false,
         },
     ]
+}
+
+/// File arguments, without flags. macOS settings passed as arguments
+/// (`-NSRequiresAquaSystemAppearance YES`) take a value, which is skipped too.
+fn cli_paths(args: impl Iterator<Item = OsString>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut skip_value = false;
+    for arg in args {
+        let text = arg.to_string_lossy();
+        if std::mem::take(&mut skip_value) {
+            continue;
+        }
+        if text.starts_with('-') {
+            skip_value = text.starts_with("-NS") || text.starts_with("-Apple");
+            continue;
+        }
+        paths.push(PathBuf::from(arg));
+    }
+    paths
 }
 
 /// `file:///Users/me/My%20Notes.txt` → `/Users/me/My Notes.txt`.
@@ -176,4 +193,16 @@ fn file_url_to_path(url: &str) -> Option<PathBuf> {
         }
     }
     Some(PathBuf::from(OsString::from_vec(out)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cli_paths;
+    use std::path::PathBuf;
+
+    #[test]
+    fn cli_skips_flags_and_macos_settings() {
+        let args = ["-NSRequiresAquaSystemAppearance", "YES", "a.txt", "--verbose", "b.md"].map(Into::into);
+        assert_eq!(cli_paths(args.into_iter()), [PathBuf::from("a.txt"), PathBuf::from("b.md")]);
+    }
 }

@@ -10,6 +10,15 @@ use serde::{Deserialize, Serialize};
 pub struct Session {
     pub tabs: Vec<SessionTab>,
     pub active: Option<usize>,
+    /// Watched folders shown in the sidebar.
+    #[serde(default)]
+    pub folders: Vec<PathBuf>,
+    /// The folder the sidebar shows (`None`: open files).
+    #[serde(default)]
+    pub scope: Option<usize>,
+    /// The shown file when it came from a watched folder (not in `tabs`).
+    #[serde(default)]
+    pub folder_file: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -63,6 +72,9 @@ mod tests {
         let session = Session {
             tabs: vec![SessionTab { path: "/tmp/a.txt".into(), top_line: 42 }],
             active: Some(0),
+            folders: vec!["/tmp/notes".into()],
+            scope: Some(0),
+            folder_file: Some("/tmp/notes/a.md".into()),
         };
         save_to(&path, &session).unwrap();
         assert_eq!(load_from(&path), session);

@@ -17,6 +17,8 @@ pub struct FileMeta {
     pub modified: Option<SystemTime>,
     /// First non-empty line, Markdown heading marks stripped.
     pub snippet: String,
+    /// Not text: watched folders leave these out.
+    pub binary: bool,
 }
 
 /// macOS: the file's contents live only in iCloud (`SF_DATALESS`). Reading
@@ -28,15 +30,15 @@ pub fn peek(path: &Path) -> FileMeta {
     let meta = std::fs::metadata(path).ok();
     let modified = meta.as_ref().and_then(|m| m.modified().ok());
     if meta.is_some_and(|m| m.st_flags() & SF_DATALESS != 0) {
-        return FileMeta { modified, snippet: "In iCloud".into() };
+        return FileMeta { modified, snippet: "In iCloud".into(), binary: false };
     }
     let mut buf = Vec::with_capacity(PEEK_BYTES);
     let read = std::fs::File::open(path).and_then(|f| f.take(PEEK_BYTES as u64).read_to_end(&mut buf));
     if read.is_err() {
-        return FileMeta { modified, snippet: "Can't read file".into() };
+        return FileMeta { modified, snippet: "Can't read file".into(), binary: false };
     }
     if !encoding::has_bom(&buf) && buf.contains(&0) {
-        return FileMeta { modified, snippet: "Binary file".into() };
+        return FileMeta { modified, snippet: "Binary file".into(), binary: true };
     }
     // Don't let a character cut in half at the 2KB mark trigger encoding detection.
     if let Err(err) = std::str::from_utf8(&buf) {
@@ -45,7 +47,7 @@ pub fn peek(path: &Path) -> FileMeta {
         }
     }
     let text = String::from_utf8_lossy(&encoding::decode(buf).utf8).into_owned();
-    FileMeta { modified, snippet: first_line(&text) }
+    FileMeta { modified, snippet: first_line(&text), binary: false }
 }
 
 /// Searches inside a file for the sidebar's content search: returns the
