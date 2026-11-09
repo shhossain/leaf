@@ -326,6 +326,29 @@ impl Viewer {
         &self.doc
     }
 
+    /// Swaps in a newer version of the same file (it grew on disk). If the
+    /// reader was at the bottom, the view follows the new lines, like `tail -f`.
+    pub fn replace_doc(&mut self, doc: Arc<Document>, cx: &mut Context<Self>) {
+        let old_lines = self.doc.line_count();
+        let at_bottom = self.top_line() as f32 + self.page_rows() + 2. >= old_lines as f32;
+        self.doc = doc;
+        // Highlighting before the old last chunk is still right; redo the rest.
+        let last_chunk = (old_lines - 1) / CHUNK;
+        self.chunk_cache.retain(|(chunk, ..)| *chunk < last_chunk);
+        self.checkpoints.truncate(last_chunk + 1);
+        if self.preview.is_some() {
+            self.preview = self.build_preview();
+        }
+        if at_bottom {
+            // Deferred by the list until it has laid out the new rows.
+            self.scroll.scroll_to_item(self.doc.line_count() - 1, ScrollStrategy::Bottom);
+        }
+        if self.find.is_some() {
+            self.run_search(cx);
+        }
+        cx.notify();
+    }
+
     pub fn top_line(&self) -> usize {
         let offset = self.scroll.0.borrow().base_handle.offset();
         ((-offset.y / self.row_height).max(0.) as usize).min(self.doc.line_count() - 1)
@@ -494,7 +517,7 @@ impl Viewer {
 
         for (i, source) in line_ranges.into_iter().enumerate() {
             let line = range.start + i;
-            let display = DisplayLine::new(&self.doc.bytes()[source.clone()]);
+            let display = DisplayLine::new(&self.doc.slice(source.clone()));
             let to_display = |r: Range<usize>| display.source_to_display(r.start)..display.source_to_display(r.end);
 
             let mut colors = Vec::new();
@@ -573,8 +596,8 @@ impl Viewer {
         let last = self.doc.line_count() - 1;
         let line = ((y / self.row_height).floor().max(0.) as usize).min(last);
         let x = point.x - bounds.left() - offset.x - self.gutter_width;
-        let raw = &self.doc.bytes()[self.doc.line_range(line)];
-        let display = DisplayLine::new(raw);
+        let raw = self.doc.slice(self.doc.line_range(line));
+        let display = DisplayLine::new(&raw);
         let col = if x <= px(0.) || display.text.is_empty() {
             0
         } else {
@@ -923,7 +946,27 @@ fn search(doc: &Document, query: &str) -> Vec<Range<usize>> {
     else {
         return Vec::new();
     };
-    regex.find_iter(doc.bytes()).take(MAX_MATCHES).map(|m| m.range()).collect()
+    if let Some(all) = doc.as_slice() {
+        return regex.find_iter(all).take(MAX_MATCHES).map(|m| m.range()).collect();
+    }
+    // On disk: search in large chunks that overlap by enough bytes for a match
+    // to straddle a boundary; each match belongs to the chunk it starts in.
+    let overlap = query.len() * 4 + 16;
+    let mut found: Vec<Range<usize>> = Vec::new();
+    let mut pos = 0;
+    while pos < doc.len() && found.len() < MAX_MATCHES {
+        let end = (pos + crate::text_index::SCAN_CHUNK).min(doc.len());
+        let chunk = doc.slice(pos..end + overlap);
+        for m in regex.find_iter(&chunk) {
+            let start = pos + m.start();
+            if start >= end || found.len() >= MAX_MATCHES {
+                break;
+            }
+            found.push(start..pos + m.end());
+        }
+        pos = end;
+    }
+    found
 }
 
 /// Flattens color spans and background spans into the sorted, non-overlapping

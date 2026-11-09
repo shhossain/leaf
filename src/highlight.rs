@@ -78,7 +78,7 @@ impl LineState {
 pub fn advance(doc: &Document, mut state: LineState, lines: Range<usize>) -> LineState {
     let mut namer = Namer::default();
     for range in doc.line_ranges(lines) {
-        state.parse(&doc.bytes()[range], &mut namer, None);
+        state.parse(&doc.slice(range), &mut namer, None);
     }
     state
 }
@@ -90,7 +90,7 @@ pub fn highlight(doc: &Document, mut state: LineState, lines: Range<usize>) -> V
         .into_iter()
         .map(|range| {
             let mut spans = Spans::new();
-            state.parse(&doc.bytes()[range], &mut namer, Some(&mut spans));
+            state.parse(&doc.slice(range), &mut namer, Some(&mut spans));
             spans
         })
         .collect()

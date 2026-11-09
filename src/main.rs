@@ -1,5 +1,8 @@
 //! Leaf: a lightweight, viewer-first text editor for macOS with lazy tabs.
 
+// The syntax palette in style.rs is one `serde_json::json!` table.
+#![recursion_limit = "256"]
+
 mod doc;
 mod encoding;
 mod file_list;

@@ -2,8 +2,12 @@
 //! light/dark switch. The stock dark theme is near-black; macOS uses soft
 //! greys, quiet separators and a warm yellow accent.
 
+use std::sync::Arc;
+
+use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::component::theme::Theme;
 use gpui_kit::*;
+use serde_json::json;
 
 /// Notes' highlight for the selected row.
 pub fn selection_row(dark: bool) -> (Hsla, Hsla) {
@@ -59,6 +63,98 @@ pub fn apply(window: Option<&mut Window>, cx: &mut App) {
         c.scrollbar_thumb = alpha(0x000000, 0.20);
         c.scrollbar_thumb_hover = alpha(0x000000, 0.32);
     }
+    let syntax = syntax_theme(dark);
+    match serde_json::from_value::<HighlightTheme>(syntax) {
+        Ok(theme) => Theme::global_mut(cx).highlight_theme = Arc::new(theme),
+        Err(err) => eprintln!("[leaf] syntax palette rejected: {err}"),
+    }
+}
+
+/// Muted, low-saturation syntax colors that sit with the soft greys instead
+/// of the stock high-contrast palette. Same names as gpui-component themes.
+fn syntax_theme(dark: bool) -> serde_json::Value {
+    let p = if dark {
+        Palette {
+            background: "#1e1e1e", foreground: "#dedede", line_number: "#5c5c60", active_line: "#252525",
+            keyword: "#d4a0bf", string: "#a7c49a", number: "#d4b48c", comment: "#77777d",
+            function: "#97b6d4", kind: "#93bfb5", tag: "#97b6d4", escape: "#c9a67e",
+            punctuation: "#a3a3a8", title: "#ececec", link: "#97b6d4", muted: "#8e8e93",
+        }
+    } else {
+        Palette {
+            background: "#ffffff", foreground: "#262628", line_number: "#b4b4b8", active_line: "#f6f6f6",
+            keyword: "#984074", string: "#40723a", number: "#8a5d1f", comment: "#8e8e93",
+            function: "#2f5e8e", kind: "#2a6a60", tag: "#2f5e8e", escape: "#8a5d1f",
+            punctuation: "#5f5f64", title: "#1d1d1f", link: "#2f5e8e", muted: "#86868b",
+        }
+    };
+    let c = |color: &str| json!({ "color": color });
+    json!({
+        "name": "Leaf",
+        "appearance": if dark { "dark" } else { "light" },
+        "style": {
+            "editor.background": p.background,
+            "editor.gutter.background": p.background,
+            "editor.foreground": p.foreground,
+            "editor.active_line.background": p.active_line,
+            "editor.line_number": p.line_number,
+            "editor.active_line_number": p.punctuation,
+            "syntax": {
+                "keyword": c(p.keyword),
+                "preproc": c(p.keyword),
+                "variable.special": c(p.keyword),
+                "string": c(p.string),
+                "string.escape": c(p.escape),
+                "string.regex": c(p.escape),
+                "string.special": c(p.escape),
+                "string.special.symbol": c(p.escape),
+                "number": c(p.number),
+                "boolean": c(p.number),
+                "constant": c(p.number),
+                "label": c(p.number),
+                "attribute": c(p.number),
+                "comment": { "color": p.comment, "font_style": "italic" },
+                "comment.doc": { "color": p.comment, "font_style": "italic" },
+                "function": c(p.function),
+                "constructor": c(p.kind),
+                "type": c(p.kind),
+                "tag": c(p.tag),
+                "property": c(p.foreground),
+                "variable": c(p.foreground),
+                "operator": c(p.punctuation),
+                "punctuation": c(p.punctuation),
+                "punctuation.bracket": c(p.punctuation),
+                "punctuation.delimiter": c(p.punctuation),
+                "punctuation.list_marker": c(p.muted),
+                "title": { "color": p.title, "font_weight": 600 },
+                "emphasis": { "font_style": "italic" },
+                "emphasis.strong": { "font_weight": 700 },
+                "link_text": c(p.link),
+                "link_uri": c(p.muted),
+                "text.literal": c(p.escape),
+                "text.code.span": c(p.escape),
+            }
+        }
+    })
+}
+
+struct Palette {
+    background: &'static str,
+    foreground: &'static str,
+    line_number: &'static str,
+    active_line: &'static str,
+    keyword: &'static str,
+    string: &'static str,
+    number: &'static str,
+    comment: &'static str,
+    function: &'static str,
+    kind: &'static str,
+    tag: &'static str,
+    escape: &'static str,
+    punctuation: &'static str,
+    title: &'static str,
+    link: &'static str,
+    muted: &'static str,
 }
 
 trait ThemeMode {

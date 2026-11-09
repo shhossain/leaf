@@ -191,6 +191,8 @@ pub struct Workspace {
     next_id: u64,
     focus: FocusHandle,
     sidebar_open: bool,
+    /// Re-checks the visible file on disk (live reload, log tailing).
+    _disk_poll: Option<Task<()>>,
     sidebar_list: ListState,
     sidebar_items: Vec<SidebarItem>,
     search: Entity<InputState>,
@@ -215,6 +217,21 @@ impl Workspace {
             }
         })
         .detach();
+        // Live reload and log tailing: one `stat` of the visible file every
+        // second while active, every 3 s in the background (watching a log in
+        // a side window is a main use). No file watchers, no per-file timers.
+        let disk_poll = cx.spawn_in(window, async move |this, cx| loop {
+            let active = this.update_in(cx, |_, window, _| window.is_window_active()).unwrap_or(false);
+            cx.background_executor().timer(Duration::from_secs(if active { 1 } else { 3 })).await;
+            let alive = this.update_in(cx, |this, window, cx| {
+                if let Some(id) = this.active {
+                    this.check_disk(id, window, cx);
+                }
+            });
+            if alive.is_err() {
+                break;
+            }
+        });
         let weak = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             weak.update(cx, |this, cx| this.confirm_quit(window, cx)).unwrap_or(true)
@@ -247,6 +264,7 @@ impl Workspace {
             next_id: 1,
             focus,
             sidebar_open: true,
+            _disk_poll: Some(disk_poll),
             sidebar_list: ListState::new(0, ListAlignment::Top, px(400.)),
             sidebar_items: Vec::new(),
             search,
@@ -451,7 +469,7 @@ impl Workspace {
                 (tab.format, tab.stamp, tab.conflict) = (format, Some(stamp), None);
                 // Edits that were never saved (crash, Dock quit) come back as unsaved changes.
                 if let Some(text) = recovery::load(&tab.path) {
-                    if text.as_bytes() == doc.bytes() {
+                    if text.as_bytes() == doc.slice(0..doc.len()).as_ref() {
                         recovery::discard(&tab.path);
                     } else {
                         doc = Arc::new(Document::new(Bytes::Owned(text.into_bytes()), false));
@@ -558,6 +576,14 @@ impl Workspace {
         if now == known || self.tabs[ix].stamp != known || !self.tabs[ix].is_live() {
             return;
         }
+        // Appended to (a log being written): index just the new part and follow it.
+        let viewing = matches!(self.tabs[ix].state, TabState::Viewing { .. });
+        if let (Some(stamp), Some(old), true, false) = (now, known, viewing, self.tabs[ix].dirty) {
+            if stamp.len() > old.len() {
+                self.tail(id, stamp, cx);
+                return;
+            }
+        }
         let tab = &mut self.tabs[ix];
         match now {
             None => tab.conflict = Some("deleted on disk"),
@@ -570,6 +596,46 @@ impl Workspace {
             }
         }
         cx.notify();
+    }
+
+    fn tail(&mut self, id: u64, stamp: DiskStamp, cx: &mut Context<Self>) {
+        let Some(ix) = self.index_of(id) else { return };
+        let TabState::Viewing { viewer, .. } = &self.tabs[ix].state else { return };
+        let (viewer, known) = (viewer.clone(), self.tabs[ix].stamp);
+        let doc = viewer.read(cx).doc().clone();
+        let path = self.tabs[ix].path.clone();
+        let format = self.tabs[ix].format;
+        let utf8 = format.encoding == encoding_rs::UTF_8 && !format.bom && !doc.lossy;
+        cx.spawn(async move |this, cx| {
+            let grown = cx
+                .background_executor()
+                .spawn(async move { doc::appended(&path, &doc, stamp.len() as usize, utf8) })
+                .await;
+            this.update(cx, |this, cx| {
+                let Some(ix) = this.index_of(id) else { return };
+                if this.tabs[ix].stamp != known || this.tabs[ix].dirty {
+                    return; // something else happened meanwhile
+                }
+                match grown {
+                    Some(grown) => {
+                        viewer.update(cx, |viewer, cx| viewer.replace_doc(Arc::new(grown), cx));
+                        this.tabs[ix].stamp = Some(stamp);
+                        this.refresh_meta(id, cx);
+                    }
+                    None => {
+                        // Rewritten rather than appended: reload, keeping the position.
+                        let tab = &mut this.tabs[ix];
+                        tab.top_line = tab.current_line(cx);
+                        tab.state = TabState::Cold;
+                        this.recent.retain(|&x| x != id);
+                        this.refresh_meta(id, cx);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // ── editing & saving ───────────────────────────────────────────────────
@@ -589,7 +655,7 @@ impl Workspace {
                 // A double-click puts the cursor where you clicked; ⌘E keeps the reading position.
                 let cursor = match at {
                     Some(pos) => {
-                        let raw = &doc.bytes()[doc.line_range(pos.line)];
+                        let raw = doc.slice(doc.line_range(pos.line));
                         let before = String::from_utf8_lossy(&raw[..pos.col.min(raw.len())]);
                         Position::new(pos.line as u32, before.encode_utf16().count() as u32)
                     }

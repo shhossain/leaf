@@ -8,7 +8,8 @@ use std::time::SystemTime;
 use crate::encoding::{self, TextFormat};
 use crate::text_index::{Bytes, Document};
 
-/// Files above this are memory-mapped instead of read into memory.
+
+/// Files above this are read from disk on demand instead of into memory.
 pub const MAP_ABOVE_BYTES: u64 = 64 * 1024 * 1024;
 /// The full editor holds ~12× the file size; above this, tabs stay view-only.
 pub const MAX_EDIT_BYTES: usize = 16 * 1024 * 1024;
@@ -18,6 +19,12 @@ pub const MAX_EDIT_BYTES: usize = 16 * 1024 * 1024;
 pub struct DiskStamp {
     modified: Option<SystemTime>,
     len: u64,
+}
+
+impl DiskStamp {
+    pub fn len(&self) -> u64 {
+        self.len
+    }
 }
 
 /// `None` if the file no longer exists.
@@ -41,15 +48,12 @@ pub fn load(path: &Path) -> std::io::Result<Loaded> {
     };
 
     if meta.len() > MAP_ABOVE_BYTES {
-        // SAFETY: the map is read-only. If another process truncates the file
-        // while it is open, reads past the new end fault — the same trade-off
-        // every mmap-based viewer (less, ripgrep) accepts. Huge files are
+        // Big files stay on disk and are read in blocks as needed. They are
         // shown as (lossy) UTF-8 without encoding detection.
-        let bytes = Bytes::Mapped(unsafe { memmap2::Mmap::map(&file)? });
-        if looks_binary(&bytes) {
+        let doc = Document::open_file(file, meta.len() as usize);
+        if looks_binary(&doc.slice(0..8192)) {
             return Ok(Loaded::Binary { bytes: meta.len() });
         }
-        let doc = Document::new(bytes, false);
         let format = TextFormat { crlf: doc.crlf, ..TextFormat::default() };
         return Ok(Loaded::Doc { doc: Arc::new(doc), format, stamp });
     }
@@ -73,6 +77,27 @@ pub fn load(path: &Path) -> std::io::Result<Loaded> {
     Ok(Loaded::Doc { doc: Arc::new(doc), format, stamp })
 }
 
+/// The file at `path` after it grew to `new_len`, if bytes were only added at
+/// the end (a log being written). Only the new part is indexed. `None` means
+/// the file changed some other way and must be reloaded.
+pub fn appended(path: &Path, doc: &Document, new_len: usize, utf8: bool) -> Option<Document> {
+    use std::os::unix::fs::FileExt as _;
+    let file = std::fs::File::open(path).ok()?;
+    let sample = doc.tail_sample();
+    let mut on_disk = vec![0; sample.len()];
+    file.read_exact_at(&mut on_disk, (doc.len() - sample.len()) as u64).ok()?;
+    if on_disk != sample {
+        return None;
+    }
+    match doc.extended(new_len) {
+        Some(grown) => Some(grown),
+        // An in-memory file that grew becomes an on-disk one (no copying);
+        // only plain UTF-8 can be read that way.
+        None if utf8 => Some(Document::open_file(file, new_len)),
+        None => None,
+    }
+}
+
 /// The token the editor's highlighter resolves to a grammar: the extension
 /// (`rs`, `py`), or the whole file name for extensionless files (`Makefile`).
 pub fn language_token(path: &Path) -> String {
@@ -87,9 +112,9 @@ pub fn language_token(path: &Path) -> String {
 
 /// Does the file indent with tabs? Decides what the Tab key inserts when editing.
 pub fn indents_with_tabs(doc: &Document) -> bool {
-    let head = &doc.bytes()[..doc.len().min(64 * 1024)];
-    let tabbed = memchr::memmem::find_iter(head, b"\n\t").count();
-    let spaced = memchr::memmem::find_iter(head, b"\n  ").count();
+    let head = doc.slice(0..64 * 1024);
+    let tabbed = memchr::memmem::find_iter(&head, b"\n\t").count();
+    let spaced = memchr::memmem::find_iter(&head, b"\n  ").count();
     tabbed > spaced || head.first() == Some(&b'\t')
 }
 
