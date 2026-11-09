@@ -166,6 +166,8 @@ pub struct Viewer {
     preview: Option<SharedString>,
     /// Folder of the file; relative image paths in Markdown resolve against it.
     base_dir: PathBuf,
+    /// Where a double-click asked to start editing; read by the workspace.
+    edit_at: Option<Pos>,
 }
 
 impl Viewer {
@@ -197,6 +199,7 @@ impl Viewer {
             rich: rich_kind(path),
             preview: None,
             base_dir: path.parent().map(Path::to_path_buf).unwrap_or_default(),
+            edit_at: None,
         };
         // Viewer-first: Markdown opens rendered and text reads like Notes;
         // ⌘⇧V switches to numbered source lines.
@@ -238,6 +241,12 @@ impl Viewer {
         let base = self.base_dir.clone();
         div()
             .id("preview")
+            // Double-click anywhere on the page to start editing, like Notes.
+            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                if event.click_count == 2 {
+                    this.request_edit(None, window, cx);
+                }
+            }))
             .key_context("Viewer")
             .track_focus(&self.focus)
             .flex_1()
@@ -509,13 +518,14 @@ impl Viewer {
         Pos { line, col: display.display_to_source(col) }
     }
 
-    fn word_at(&self, pos: Pos) -> (Pos, Pos) {
-        let raw = &self.doc.bytes()[self.doc.line_range(pos.line)];
-        let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
-        let col = pos.col.min(raw.len());
-        let start = raw[..col].iter().rposition(|&b| !is_word(b)).map_or(0, |p| p + 1);
-        let end = raw[col..].iter().position(|&b| !is_word(b)).map_or(raw.len(), |p| col + p);
-        (Pos { line: pos.line, col: start }, Pos { line: pos.line, col: end })
+    /// The position a double-click asked to edit at, if any (taken once).
+    pub fn take_edit_at(&mut self) -> Option<Pos> {
+        self.edit_at.take()
+    }
+
+    fn request_edit(&mut self, at: Option<Pos>, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_at = at;
+        window.dispatch_action(Box::new(crate::ToggleEdit), cx);
     }
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -524,8 +534,10 @@ impl Viewer {
         self.flash_line = None;
         match event.click_count {
             2 => {
-                let (start, end) = self.word_at(pos);
-                (self.anchor, self.head) = (Some(start), end);
+                // Double-click edits, with the cursor where you clicked.
+                self.anchor = None;
+                self.request_edit(Some(pos), window, cx);
+                return;
             }
             3 => {
                 let len = self.doc.line_range(pos.line).len();

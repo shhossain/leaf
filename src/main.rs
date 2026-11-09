@@ -53,6 +53,8 @@ fn main() {
         let bounds = Bounds::centered(None, size(px(1100.), px(760.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
+            // The sidebar is translucent over this blur, like Notes.
+            window_background: WindowBackgroundAppearance::Blurred,
             // Like Notes: no title bar; traffic lights sit inside the toolbar.
             titlebar: Some(TitlebarOptions {
                 title: None,
