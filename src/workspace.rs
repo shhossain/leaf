@@ -1,4 +1,5 @@
-//! The window: a tab bar over exactly one visible document.
+//! The window, laid out like Apple Notes: a sidebar listing open files
+//! (grouped by date, with a first-line preview) beside exactly one document.
 //!
 //! Tabs are lazy. Opening 500 files only records 500 paths; a file is read
 //! from disk the first time its tab is shown. Files open in the lightweight
@@ -8,12 +9,14 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme as _, h_flex,
-    input::{Editor, EditorState, InputEvent, Position, TabSize},
-    tab::{Tab, TabBar},
+    ActiveTheme as _, Icon, Sizable as _,
+    button::{Button, ButtonVariants as _},
+    h_flex,
+    input::{Editor, EditorState, Input, InputEvent, InputState, Position, TabSize},
     theme::Theme,
     v_flex,
 };
@@ -22,15 +25,22 @@ use gpui_kit::*;
 
 use crate::doc::{self, DiskStamp, Loaded};
 use crate::encoding::{self, TextFormat};
+use crate::file_list::{self, FileMeta};
 use crate::session::{self, Session, SessionTab};
 use crate::text_index::{Bytes, Document};
-use crate::viewer::Viewer;
-use crate::{CloseTab, NextTab, OpenFile, PrevTab, Quit, ReopenClosed, Save, ToggleEdit};
+use crate::viewer::{RichKind, Viewer};
+use crate::{
+    CloseTab, FocusSearch, NextTab, OpenFile, PrevTab, Quit, ReopenClosed, Save, ToggleEdit, ToggleSidebar,
+};
 
 /// Tabs kept in memory at once. Everything else is just a path.
 const MAX_LIVE: usize = 12;
 /// Closed tabs remembered for ⌘⇧T.
 const MAX_CLOSED: usize = 50;
+const SIDEBAR_WIDTH: f32 = 290.;
+const TOOLBAR_HEIGHT: f32 = 52.;
+/// Room for the traffic lights, which sit inside the toolbar like in Notes.
+const TRAFFIC_LIGHTS_WIDTH: f32 = 78.;
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -43,6 +53,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-tab", PrevTab, Some("Workspace")),
         KeyBinding::new("cmd-}", NextTab, Some("Workspace")),
         KeyBinding::new("cmd-{", PrevTab, Some("Workspace")),
+        KeyBinding::new("cmd-alt-s", ToggleSidebar, Some("Workspace")),
+        KeyBinding::new("cmd-alt-f", FocusSearch, Some("Workspace")),
     ]);
 }
 
@@ -78,6 +90,9 @@ struct DocTab {
     stamp: Option<DiskStamp>,
     /// Set when the file changed or vanished on disk while we had unsaved edits.
     conflict: Option<&'static str>,
+    /// Date and first line for the sidebar; read from the first 2KB only.
+    meta: Option<FileMeta>,
+    peeking: bool,
 }
 
 impl DocTab {
@@ -96,7 +111,21 @@ impl DocTab {
             format: TextFormat::default(),
             stamp: None,
             conflict: None,
+            meta: None,
+            peeking: false,
         }
+    }
+
+    fn modified(&self) -> Option<SystemTime> {
+        self.meta.as_ref().and_then(|m| m.modified)
+    }
+
+    fn folder(&self) -> String {
+        self.path
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/".into())
     }
 
     fn doc<'a>(&'a self, cx: &'a App) -> Option<&'a Arc<Document>> {
@@ -130,7 +159,9 @@ pub struct Workspace {
     closed: Vec<(PathBuf, usize)>,
     next_id: u64,
     focus: FocusHandle,
-    tab_scroll: ScrollHandle,
+    sidebar_open: bool,
+    search: Entity<InputState>,
+    _search_events: Subscription,
     title: SharedString,
     _session_save: Option<Task<()>>,
 }
@@ -162,6 +193,12 @@ impl Workspace {
             async {}
         })
         .detach();
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
+        let search_events = cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
         Self {
             tabs: Vec::new(),
             active: None,
@@ -169,7 +206,9 @@ impl Workspace {
             closed: Vec::new(),
             next_id: 1,
             focus,
-            tab_scroll: ScrollHandle::new(),
+            sidebar_open: true,
+            search,
+            _search_events: search_events,
             title: SharedString::default(),
             _session_save: None,
         }
@@ -195,8 +234,59 @@ impl Workspace {
             self.active = Some(id);
             self.schedule_session_save(cx);
         }
+        self.peek_missing(cx);
         cx.notify();
         first
+    }
+
+    /// Reads dates and first lines for sidebar rows that don't have them yet.
+    fn peek_missing(&mut self, cx: &mut Context<Self>) {
+        let todo: Vec<(u64, PathBuf)> = self
+            .tabs
+            .iter_mut()
+            .filter(|t| t.meta.is_none() && !t.peeking)
+            .map(|t| {
+                t.peeking = true;
+                (t.id, t.path.clone())
+            })
+            .collect();
+        if todo.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let metas = cx
+                .background_executor()
+                .spawn(async move { todo.into_iter().map(|(id, path)| (id, file_list::peek(&path))).collect::<Vec<_>>() })
+                .await;
+            this.update(cx, |this, cx| {
+                for (id, meta) in metas {
+                    if let Some(ix) = this.index_of(id) {
+                        (this.tabs[ix].meta, this.tabs[ix].peeking) = (Some(meta), false);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Re-reads one row's date and first line (after a save or reload).
+    fn refresh_meta(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(ix) = self.index_of(id) {
+            if !self.tabs[ix].peeking {
+                self.tabs[ix].meta = None;
+            }
+        }
+        self.peek_missing(cx);
+    }
+
+    /// Tab indices in sidebar order: most recently modified first, like Notes.
+    fn display_order(&self) -> Vec<usize> {
+        let now = SystemTime::now();
+        let mut order: Vec<usize> = (0..self.tabs.len()).collect();
+        order.sort_by_key(|&ix| std::cmp::Reverse(self.tabs[ix].modified().unwrap_or(now)));
+        order
     }
 
     fn push_tab(&mut self, path: PathBuf) -> u64 {
@@ -221,6 +311,7 @@ impl Workspace {
             }
         }
         self.active = active.or(self.tabs.first().map(|t| t.id));
+        self.peek_missing(cx);
         cx.notify();
     }
 
@@ -421,6 +512,7 @@ impl Workspace {
                 tab.top_line = tab.current_line(cx);
                 tab.state = TabState::Cold; // `render` reloads it
                 self.recent.retain(|&x| x != id);
+                self.refresh_meta(id, cx);
             }
         }
         cx.notify();
@@ -538,6 +630,7 @@ impl Workspace {
         let tab = &mut self.tabs[ix];
         (tab.stamp, tab.conflict) = (doc::stamp(&tab.path), None);
         self.set_dirty(id, false, cx);
+        self.refresh_meta(id, cx);
         true
     }
 
@@ -570,6 +663,10 @@ impl Workspace {
 
     fn remove_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.index_of(id) else { return };
+        // The row below in the sidebar takes its place (or the one above).
+        let order = self.display_order();
+        let pos = order.iter().position(|&o| o == ix).unwrap_or(0);
+        let next = order.get(pos + 1).or(pos.checked_sub(1).and_then(|p| order.get(p))).map(|&o| self.tabs[o].id);
         let line = self.tabs[ix].current_line(cx);
         let tab = self.tabs.remove(ix);
         self.closed.push((tab.path, line));
@@ -578,8 +675,8 @@ impl Workspace {
         }
         self.recent.retain(|&x| x != id);
         if self.active == Some(id) {
-            match self.tabs.get(ix).or_else(|| self.tabs.last()) {
-                Some(next) => self.activate(next.id, window, cx),
+            match next {
+                Some(next) => self.activate(next, window, cx),
                 None => {
                     self.active = None;
                     window.focus(&self.focus, cx);
@@ -628,12 +725,13 @@ impl Workspace {
     }
 
     fn cycle(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let n = self.tabs.len() as isize;
+        let order = self.display_order();
+        let n = order.len() as isize;
         if n == 0 {
             return;
         }
-        let ix = self.active_index().unwrap_or(0) as isize;
-        self.activate_index((ix + delta).rem_euclid(n) as usize, window, cx);
+        let pos = self.active_index().and_then(|a| order.iter().position(|&o| o == a)).unwrap_or(0) as isize;
+        self.activate_index(order[(pos + delta).rem_euclid(n) as usize], window, cx);
     }
 
     // ── actions ────────────────────────────────────────────────────────────
@@ -698,56 +796,246 @@ impl Workspace {
         self.cycle(-1, window, cx);
     }
 
+    fn on_toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_open = !self.sidebar_open;
+        cx.notify();
+    }
+
+    fn on_focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_open = true;
+        self.search.update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
     // ── rendering ──────────────────────────────────────────────────────────
 
-    fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
-        let hover = cx.theme().secondary;
-        TabBar::new("tabs")
-            .track_scroll(&self.tab_scroll)
-            .selected_index(self.active_index().unwrap_or(0))
-            .on_click(cx.listener(|this, ix: &usize, window, cx| this.activate_index(*ix, window, cx)))
-            .children(self.tabs.iter().map(|tab| {
-                let id = tab.id;
-                let label = if tab.dirty { format!("● {}", tab.title) } else { tab.title.to_string() };
-                Tab::new().label(label).suffix(
+    /// An empty strip that drags the window, since the title bar is hidden.
+    fn drag_area() -> Div {
+        div().h_full().on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
+    }
+
+    fn sidebar_button(&self, cx: &mut Context<Self>) -> Button {
+        let tooltip = if self.sidebar_open { "Hide Sidebar (⌥⌘S)" } else { "Show Sidebar (⌥⌘S)" };
+        Button::new("toggle-sidebar")
+            .ghost()
+            .icon(IconName::PanelLeft)
+            .tooltip(tooltip)
+            .on_click(cx.listener(|this, _, window, cx| this.on_toggle_sidebar(&ToggleSidebar, window, cx)))
+    }
+
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let dark = theme.mode.is_dark();
+        let (muted, border, sidebar_bg, hover_bg) = (theme.muted_foreground, theme.border, theme.sidebar, theme.secondary);
+        // Notes' highlight: a warm yellow, with text readable on it in both modes.
+        let (selected_bg, selected_fg): (Hsla, Hsla) =
+            if dark { (rgb(0x9a7b2c).into(), white()) } else { (rgb(0xf6d26b).into(), black()) };
+        let now = chrono::Local::now();
+        let query = self.search.read(cx).value().to_lowercase();
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut current_group: Option<String> = None;
+        for ix in self.display_order() {
+            let tab = &self.tabs[ix];
+            let folder = tab.folder();
+            let snippet = tab.meta.as_ref().map(|m| m.snippet.as_str()).unwrap_or("");
+            if !query.is_empty()
+                && ![tab.title.as_ref(), folder.as_str(), snippet].iter().any(|s| s.to_lowercase().contains(&query))
+            {
+                continue;
+            }
+            let modified = tab.modified().map(file_list::local);
+            let group = modified.map(|m| file_list::group_label(m, now)).unwrap_or_else(|| "Today".into());
+            if current_group.as_ref() != Some(&group) {
+                rows.push(
                     div()
-                        .id(("close-tab", id as usize))
-                        .px_1()
-                        .rounded_sm()
-                        .text_xs()
-                        .text_color(muted)
-                        .hover(move |style| style.bg(hover))
-                        .child("✕")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.close_tab(id, window, cx);
-                        })),
+                        .px_3()
+                        .pt(if current_group.is_none() { px(4.) } else { px(18.) })
+                        .pb_1p5()
+                        .text_lg()
+                        .font_weight(FontWeight::BOLD)
+                        .child(group.clone())
+                        .into_any_element(),
+                );
+                current_group = Some(group);
+            }
+
+            let id = tab.id;
+            let selected = Some(id) == self.active;
+            let row_group: SharedString = format!("row-{id}").into();
+            let sub_color = if selected { selected_fg.opacity(0.75) } else { muted };
+            let date = modified.map(|m| file_list::row_date(m, now)).unwrap_or_default();
+            let title = if tab.dirty { format!("● {}", tab.title) } else { tab.title.to_string() };
+            rows.push(
+                v_flex()
+                    .id(("file", id as usize))
+                    .group(row_group.clone())
+                    .relative()
+                    .gap_0p5()
+                    .px_3()
+                    .py_2()
+                    .rounded_lg()
+                    .when(selected, |row| row.bg(selected_bg).text_color(selected_fg))
+                    .when(!selected, |row| row.hover(move |style| style.bg(hover_bg)))
+                    .on_click(cx.listener(move |this, _, window, cx| this.activate(id, window, cx)))
+                    .child(div().pr_5().font_weight(FontWeight::BOLD).truncate().child(title))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .text_sm()
+                            .min_w_0()
+                            .child(div().flex_none().child(date))
+                            .child(div().min_w_0().truncate().text_color(sub_color).child(snippet.to_string())),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .text_xs()
+                            .text_color(sub_color)
+                            .child(Icon::new(IconName::Folder).xsmall())
+                            .child(div().truncate().child(folder)),
+                    )
+                    .child(
+                        div()
+                            .id(("close-file", id as usize))
+                            .absolute()
+                            .top_2()
+                            .right_2()
+                            .px_1()
+                            .rounded_sm()
+                            .text_xs()
+                            .invisible()
+                            .group_hover(row_group, |style| style.visible())
+                            .hover(move |style| style.bg(hover_bg))
+                            .child("✕")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.close_tab(id, window, cx);
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        let empty = rows.is_empty();
+
+        v_flex()
+            .w(px(SIDEBAR_WIDTH))
+            .flex_none()
+            .h_full()
+            .bg(sidebar_bg)
+            .border_r_1()
+            .border_color(border)
+            .child(
+                h_flex()
+                    .h(px(TOOLBAR_HEIGHT))
+                    .flex_none()
+                    .pr_2()
+                    .child(Self::drag_area().w(px(TRAFFIC_LIGHTS_WIDTH)))
+                    .child(Self::drag_area().flex_1())
+                    .child(self.sidebar_button(cx)),
+            )
+            .child(div().px_3().pb_2().child(Input::new(&self.search).small().prefix(Icon::new(IconName::Search).xsmall())))
+            .child(
+                div()
+                    .id("file-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_2()
+                    .pb_3()
+                    .children(rows)
+                    .when(empty, |list| {
+                        let text = if query.is_empty() { "No Open Files" } else { "No Matches" };
+                        list.child(div().pt_10().w_full().text_center().text_color(muted).child(text))
+                    }),
+            )
+    }
+
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (muted, border) = (theme.muted_foreground, theme.border);
+        let tab = self.active_tab();
+        let title = tab.map(|t| t.title.clone()).unwrap_or_else(|| "Leaf".into());
+        let home = dirs::home_dir().unwrap_or_default();
+        let subtitle = tab
+            .and_then(|t| t.path.parent())
+            .map(|dir| match dir.strip_prefix(&home) {
+                Ok(rest) => format!("~/{}", rest.display()),
+                Err(_) => dir.display().to_string(),
+            })
+            .unwrap_or_else(|| format!("{} open", self.tabs.len()));
+        let editing = tab.is_some_and(|t| matches!(t.state, TabState::Editing { .. }));
+        let viewer = tab.and_then(|t| match &t.state {
+            TabState::Viewing { viewer, .. } => Some(viewer.clone()),
+            _ => None,
+        });
+        let page_toggle = viewer.as_ref().filter(|v| v.read(cx).can_toggle_page()).map(|v| {
+            let showing_page = v.read(cx).page_kind().is_some();
+            let (icon, tooltip) = if showing_page {
+                (IconName::Code, "Show Source Lines (⇧⌘V)")
+            } else {
+                (IconName::BookOpen, "Show as Page (⇧⌘V)")
+            };
+            let viewer = v.clone();
+            Button::new("page-toggle").ghost().icon(icon).tooltip(tooltip).on_click(move |_, _, cx| {
+                viewer.update(cx, |viewer, cx| viewer.toggle_page(cx));
+            })
+        });
+
+        h_flex()
+            .h(px(TOOLBAR_HEIGHT))
+            .flex_none()
+            .pr_3()
+            .gap_1()
+            .border_b_1()
+            .border_color(border)
+            .when(!self.sidebar_open, |bar| {
+                bar.child(Self::drag_area().w(px(TRAFFIC_LIGHTS_WIDTH))).child(self.sidebar_button(cx))
+            })
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .pl_4()
+                    .child(div().font_weight(FontWeight::BOLD).truncate().child(title))
+                    .child(div().text_xs().text_color(muted).truncate().child(subtitle)),
+            )
+            .child(Self::drag_area().flex_1())
+            .children(page_toggle)
+            .when(tab.is_some_and(|t| t.is_live()), |bar| {
+                bar.child(
+                    Button::new("edit")
+                        .ghost()
+                        .icon(if editing { IconName::Check } else { IconName::SquarePen })
+                        .label(if editing { "Done" } else { "Edit" })
+                        .tooltip("Toggle editing (⌘E)")
+                        .on_click(cx.listener(|this, _, window, cx| this.on_toggle_edit(&ToggleEdit, window, cx))),
                 )
-            }))
+            })
     }
 
     fn render_body(&self, cx: &mut Context<Self>) -> AnyElement {
-        let centered = |text: SharedString, cx: &mut Context<Self>| {
-            div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(cx.theme().muted_foreground)
-                .child(text)
-                .into_any_element()
+        let muted = cx.theme().muted_foreground;
+        let centered = |text: SharedString| {
+            div().size_full().flex().items_center().justify_center().text_color(muted).child(text).into_any_element()
         };
-        match self.active_tab() {
-            None => centered("Drop files here, or press ⌘O".into(), cx),
-            Some(tab) => match &tab.state {
-                TabState::Viewing { viewer, .. } => viewer.clone().into_any_element(),
-                TabState::Editing { editor, .. } => {
-                    Editor::new(editor).bordered(false).h(relative(1.)).into_any_element()
-                }
-                TabState::Message(message) => centered(message.clone(), cx),
-                TabState::Cold | TabState::Loading => div().size_full().into_any_element(),
-            },
+        let Some(tab) = self.active_tab() else {
+            return centered("Drop files here, or press ⌘O".into());
+        };
+        match &tab.state {
+            TabState::Viewing { viewer, .. } => {
+                // Pages (Markdown, prose) get Notes' date line above the text.
+                let date = viewer.read(cx).page_kind().and(tab.modified()).map(|m| file_list::full_date(file_list::local(m)));
+                v_flex()
+                    .size_full()
+                    .when_some(date, |page, date| {
+                        page.child(div().flex_none().w_full().pt_3().pb_2().text_center().text_sm().text_color(muted).child(date))
+                    })
+                    .child(div().flex_1().min_h_0().child(viewer.clone()))
+                    .into_any_element()
+            }
+            TabState::Editing { editor, .. } => Editor::new(editor).bordered(false).h(relative(1.)).into_any_element(),
+            TabState::Message(message) => centered(message.clone()),
+            TabState::Cold | TabState::Loading => div().size_full().into_any_element(),
         }
     }
 
@@ -759,7 +1047,10 @@ impl Workspace {
             if let TabState::Editing { .. } = tab.state {
                 (mode, mode_color) = ("EDIT", theme.warning);
             } else if let TabState::Viewing { viewer, .. } = &tab.state {
-                mode = if viewer.read(cx).is_previewing() { "PREVIEW" } else { "VIEW" };
+                mode = match viewer.read(cx).page_kind() {
+                    Some(RichKind::Markdown) => "PREVIEW",
+                    _ => "VIEW",
+                };
             }
             warning = tab.conflict.map(|c| format!("⚠ {c}"));
             if let TabState::Viewing { viewer, .. } = &tab.state {
@@ -782,17 +1073,15 @@ impl Workspace {
             }
             details.push(format!("{}/{} loaded", self.recent.len(), self.tabs.len()));
         }
-        let path = self.active_tab().map(|t| t.path.display().to_string()).unwrap_or_default();
         h_flex()
             .flex_none()
             .justify_between()
             .gap_4()
-            .px_3()
+            .px_4()
             .py_1()
             .text_xs()
             .border_t_1()
             .border_color(theme.border)
-            .bg(theme.secondary)
             .text_color(theme.muted_foreground)
             .child(
                 h_flex()
@@ -804,14 +1093,9 @@ impl Workspace {
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(mode_color)
                             .child(mode)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.on_toggle_edit(&ToggleEdit, window, cx)
-                            })),
+                            .on_click(cx.listener(|this, _, window, cx| this.on_toggle_edit(&ToggleEdit, window, cx))),
                     )
-                    .when_some(warning, |this, warning| {
-                        this.child(div().flex_none().text_color(theme.danger).child(warning))
-                    })
-                    .child(div().truncate().child(path)),
+                    .when_some(warning, |this, warning| this.child(div().flex_none().text_color(theme.danger).child(warning))),
             )
             .child(div().flex_none().child(details.join("  ·  ")))
     }
@@ -831,7 +1115,7 @@ impl Render for Workspace {
             self.title = title;
         }
 
-        v_flex()
+        h_flex()
             .id("workspace")
             .key_context("Workspace")
             .track_focus(&self.focus)
@@ -846,11 +1130,20 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_quit))
             .on_action(cx.listener(Self::on_next))
             .on_action(cx.listener(Self::on_prev))
+            .on_action(cx.listener(Self::on_toggle_sidebar))
+            .on_action(cx.listener(Self::on_focus_search))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.open_paths(paths.paths().to_vec(), cx);
             }))
-            .when(!self.tabs.is_empty(), |this| this.child(self.render_tab_bar(cx)))
-            .child(div().flex_1().min_h_0().child(self.render_body(cx)))
-            .child(self.render_status_bar(cx))
+            .when(self.sidebar_open, |this| this.child(self.render_sidebar(cx)))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(self.render_toolbar(cx))
+                    .child(div().flex_1().min_h_0().child(self.render_body(cx)))
+                    .child(self.render_status_bar(cx)),
+            )
     }
 }

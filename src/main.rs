@@ -2,6 +2,7 @@
 
 mod doc;
 mod encoding;
+mod file_list;
 mod highlight;
 mod session;
 mod text_index;
@@ -17,10 +18,13 @@ use gpui_kit::*;
 
 use workspace::Workspace;
 
-actions!(leaf, [Quit, OpenFile, Save, CloseTab, ReopenClosed, ToggleEdit, NextTab, PrevTab]);
+actions!(
+    leaf,
+    [Quit, OpenFile, Save, CloseTab, ReopenClosed, ToggleEdit, NextTab, PrevTab, ToggleSidebar, FocusSearch]
+);
 
 fn main() {
-    let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
+    let app = gpui_kit::application().with_assets(gpui_kit::assets::AllAssets);
 
     // Finder "Open With", double-clicks, and drops on the Dock icon arrive as
     // file:// URLs — possibly before the window exists, so queue them.
@@ -49,6 +53,12 @@ fn main() {
         let bounds = Bounds::centered(None, size(px(1100.), px(760.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
+            // Like Notes: no title bar; traffic lights sit inside the toolbar.
+            titlebar: Some(TitlebarOptions {
+                title: None,
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(18.), px(20.))),
+            }),
             ..Default::default()
         };
         let (_, workspace) = gpui_kit::open_window(options, cx, |window, cx| {
@@ -98,7 +108,9 @@ fn menus() -> Vec<Menu> {
             name: "View".into(),
             items: vec![
                 MenuItem::action("Toggle Edit Mode", ToggleEdit),
-                MenuItem::action("Markdown Preview", viewer::TogglePreview),
+                MenuItem::action("Page / Source Lines", viewer::TogglePreview),
+                MenuItem::action("Show/Hide Sidebar", ToggleSidebar),
+                MenuItem::action("Search Files", FocusSearch),
                 MenuItem::separator(),
                 MenuItem::action("Next Tab", NextTab),
                 MenuItem::action("Previous Tab", PrevTab),

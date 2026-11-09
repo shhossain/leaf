@@ -3410,6 +3410,7 @@ name = "leaf"
 version = "0.1.0"
 dependencies = [
  "chardetng",
+ "chrono",
  "dirs 6.0.0",
  "encoding_rs",
  "futures",

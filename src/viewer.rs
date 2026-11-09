@@ -13,7 +13,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, h_flex,
     input::{Input, InputEvent, InputState},
     scroll::Scrollbar,
-    text::TextView,
+    text::{SelectionFormat, TextView},
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -38,10 +38,54 @@ const MAX_MATCHES: usize = 100_000;
 const WARMUP_LINES: usize = 64;
 /// Markdown bigger than this opens as source; rendering it all would be slow.
 const MAX_PREVIEW_BYTES: usize = 4 * 1024 * 1024;
+/// Plain text above this keeps the line-based view (it's virtualized; prose isn't).
+const MAX_PROSE_BYTES: usize = 256 * 1024;
 
-fn is_markdown(path: &Path) -> bool {
+/// Files shown as rendered pages rather than numbered lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RichKind {
+    /// `.md`: rendered Markdown.
+    Markdown,
+    /// `.txt`: Notes-style prose — proportional font, wrapped, no line numbers.
+    Prose,
+}
+
+fn rich_kind(path: &Path) -> Option<RichKind> {
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase());
-    matches!(ext.as_deref(), Some("md" | "markdown" | "mdown" | "mkd" | "mdx"))
+    match ext.as_deref() {
+        Some("md" | "markdown" | "mdown" | "mkd" | "mdx") => Some(RichKind::Markdown),
+        Some("txt" | "text") => Some(RichKind::Prose),
+        _ => None,
+    }
+}
+
+/// Escapes plain text so the Markdown renderer shows it verbatim: every ASCII
+/// punctuation mark is backslash-escaped, leading indentation becomes
+/// non-breaking spaces, and single newlines become hard line breaks.
+fn plain_to_markdown(text: &str) -> String {
+    let lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
+    let mut out = String::with_capacity(text.len() + text.len() / 8);
+    for (ix, line) in lines.iter().enumerate() {
+        if line.trim().is_empty() {
+            out.push('\n');
+            continue;
+        }
+        let body = line.trim_start();
+        for ch in line[..line.len() - body.len()].chars() {
+            let width = if ch == '\t' { crate::text_index::TAB_WIDTH } else { 1 };
+            out.extend(std::iter::repeat_n('\u{a0}', width));
+        }
+        for ch in body.chars() {
+            if ch.is_ascii_punctuation() {
+                out.push('\\');
+            }
+            out.push(ch);
+        }
+        // A trailing backslash is a hard break only when another line follows.
+        let next_has_text = lines.get(ix + 1).is_some_and(|l| !l.trim().is_empty());
+        out.push_str(if next_has_text { "\\\n" } else { "\n" });
+    }
+    out
 }
 
 pub fn init(cx: &mut App) {
@@ -117,8 +161,8 @@ pub struct Viewer {
     gutter_width: Pixels,
     font: Font,
     font_size: Pixels,
-    markdown: bool,
-    /// Rendered Markdown source while the preview is showing.
+    rich: Option<RichKind>,
+    /// Markdown being rendered while the page view (not numbered lines) shows.
     preview: Option<SharedString>,
     /// Folder of the file; relative image paths in Markdown resolve against it.
     base_dir: PathBuf,
@@ -150,27 +194,42 @@ impl Viewer {
             gutter_width: px(60.),
             font: font("Menlo"),
             font_size: px(13.),
-            markdown: is_markdown(path),
+            rich: rich_kind(path),
             preview: None,
             base_dir: path.parent().map(Path::to_path_buf).unwrap_or_default(),
         };
-        // Viewer-first: Markdown opens rendered; ⌘⇧V shows the source.
-        if this.markdown && this.doc.len() <= MAX_PREVIEW_BYTES {
-            this.preview = Some(this.doc.text(0..this.doc.len()).into_owned().into());
-        }
+        // Viewer-first: Markdown opens rendered and text reads like Notes;
+        // ⌘⇧V switches to numbered source lines.
+        this.preview = this.build_preview();
         this
     }
 
-    pub fn is_previewing(&self) -> bool {
-        self.preview.is_some()
+    fn build_preview(&self) -> Option<SharedString> {
+        let text = || self.doc.text(0..self.doc.len());
+        match self.rich? {
+            RichKind::Markdown if self.doc.len() <= MAX_PREVIEW_BYTES => Some(text().into_owned().into()),
+            RichKind::Prose if self.doc.len() <= MAX_PROSE_BYTES => Some(plain_to_markdown(&text()).into()),
+            _ => None,
+        }
+    }
+
+    /// Showing a rendered page (Markdown or prose) rather than numbered lines.
+    pub fn page_kind(&self) -> Option<RichKind> {
+        self.preview.as_ref().and(self.rich)
+    }
+
+    pub fn can_toggle_page(&self) -> bool {
+        self.rich.is_some()
     }
 
     fn on_toggle_preview(&mut self, _: &TogglePreview, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.markdown {
-            return;
-        }
-        if self.preview.take().is_none() && self.doc.len() <= MAX_PREVIEW_BYTES {
-            self.preview = Some(self.doc.text(0..self.doc.len()).into_owned().into());
+        self.toggle_page(cx);
+    }
+
+    /// Switches between the rendered page and numbered source lines.
+    pub fn toggle_page(&mut self, cx: &mut Context<Self>) {
+        if self.preview.take().is_none() {
+            self.preview = self.build_preview();
         }
         cx.notify();
     }
@@ -186,6 +245,7 @@ impl Viewer {
             .child(
                 TextView::markdown(("markdown", cx.entity_id().as_u64() as usize), text)
                     .selectable(true)
+                    .selection_format(SelectionFormat::Plain)
                     .scrollable(true)
                     .image_source(move |uri| {
                         let uri_text = uri.to_string();
@@ -197,7 +257,7 @@ impl Viewer {
                     })
                     .size_full()
                     .px_10()
-                    .py_6(),
+                    .pb_6(),
             )
     }
 
@@ -838,6 +898,13 @@ mod tests {
         assert_eq!(out[1].1.color, Some(gpui_kit::red()));
         assert_eq!(out[1].1.background_color, Some(gpui_kit::blue()));
         assert_eq!(out[2].1.color, None);
+    }
+
+    #[test]
+    fn plain_text_is_escaped_for_markdown() {
+        use super::plain_to_markdown;
+        let out = plain_to_markdown("# not a heading\n  * not a list\nlast\n\nnext para");
+        assert_eq!(out, "\\# not a heading\\\n\u{a0}\u{a0}\\* not a list\\\nlast\n\nnext para\n");
     }
 
     #[test]
