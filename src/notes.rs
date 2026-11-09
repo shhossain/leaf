@@ -25,6 +25,17 @@ pub fn create_new_note() -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Creates `Board.md` (or `Board 2.md`, …): an empty Kanban board with
+/// Todo, Doing and Done columns, in the Obsidian Kanban format.
+pub fn create_board() -> std::io::Result<PathBuf> {
+    let dir = notes_dir().ok_or_else(|| std::io::Error::other("no Documents folder"))?;
+    std::fs::create_dir_all(&dir)?;
+    let path = free_path(&dir, "Board");
+    std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+    std::fs::write(&path, crate::board::TEMPLATE)?;
+    Ok(path)
+}
+
 /// A file name from the note's first line, like Notes' titles: Markdown
 /// markers stripped, characters Finder dislikes removed, length capped.
 pub fn name_from_text(text: &str) -> String {

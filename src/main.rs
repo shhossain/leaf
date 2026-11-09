@@ -3,6 +3,7 @@
 // The syntax palette in style.rs is one `serde_json::json!` table.
 #![recursion_limit = "256"]
 
+mod board;
 mod doc;
 mod encoding;
 mod file_list;
@@ -27,7 +28,7 @@ use workspace::Workspace;
 
 actions!(
     leaf,
-    [Quit, OpenFile, Save, CloseTab, ReopenClosed, ToggleEdit, NextTab, PrevTab, ToggleSidebar, FocusSearch, NewNote, CompareWithPrevious, AddFolder]
+    [Quit, OpenFile, Save, CloseTab, ReopenClosed, ToggleEdit, NextTab, PrevTab, ToggleSidebar, FocusSearch, NewNote, NewBoard, CompareWithPrevious, AddFolder]
 );
 
 /// ⌘1–⌘8 open the file at that position in the sidebar; ⌘9 opens the last
@@ -129,6 +130,7 @@ fn menus() -> Vec<Menu> {
             name: "File".into(),
             items: vec![
                 MenuItem::action("New Note", NewNote),
+                MenuItem::action("New Board", NewBoard),
                 MenuItem::action("Open…", OpenFile),
                 MenuItem::action("Add Folder to Sidebar…", AddFolder),
                 MenuItem::action("Save", Save),

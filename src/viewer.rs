@@ -21,6 +21,11 @@ use gpui_kit::*;
 use futures::StreamExt as _;
 
 use crate::highlight::{self, CHUNK, Spans};
+
+#[path = "board_ui.rs"]
+mod board_ui;
+pub use board_ui::BoardEdited;
+use board_ui::BoardState;
 use crate::text_index::{Bytes, DisplayLine, Document};
 
 actions!(
@@ -54,6 +59,8 @@ pub enum RichKind {
     Json,
     /// `.csv` / `.tsv`: columns.
     Table,
+    /// A Kanban board in Markdown (Obsidian Kanban format).
+    Board,
 }
 
 /// Markdown and plain text: shown and edited as pages, not numbered code.
@@ -134,6 +141,7 @@ fn plain_to_markdown(text: &str) -> String {
 }
 
 pub fn init(cx: &mut App) {
+    board_ui::init(cx);
     let list = Some("Viewer");
     let root = Some("ViewerRoot");
     cx.bind_keys([
@@ -238,6 +246,8 @@ pub struct Viewer {
     edit_at: Option<Pos>,
     /// In the Leaf Notes folder: rendered the way Notes shows notes.
     note: bool,
+    /// The file is a Kanban board: shown as columns of cards.
+    board: Option<BoardState>,
 }
 
 impl Viewer {
@@ -276,10 +286,16 @@ impl Viewer {
             _format_task: None,
             table: None,
             note: crate::notes::is_note(path),
+            board: None,
         };
+        if this.rich == Some(RichKind::Markdown) {
+            this.board = BoardState::detect(&this.doc);
+        }
         // Viewer-first: Markdown opens rendered and text reads like Notes;
         // ⌘⇧V switches to numbered source lines.
-        this.preview = this.build_preview();
+        if this.board.is_none() {
+            this.preview = this.build_preview();
+        }
         match this.rich {
             Some(RichKind::Table) => this.table = TableLayout::detect(&this.doc, path),
             // Minified JSON (one huge line) opens formatted; tidy JSON as is.
@@ -317,11 +333,20 @@ impl Viewer {
 
     /// Showing a rendered page (Markdown or prose) rather than numbered lines.
     pub fn page_kind(&self) -> Option<RichKind> {
+        if self.board.as_ref().is_some_and(|b| b.visible) {
+            return Some(RichKind::Board);
+        }
         match self.rich? {
             RichKind::Markdown | RichKind::Prose => self.preview.as_ref().and(self.rich),
             RichKind::Json => self.raw.as_ref().and(self.rich),
             RichKind::Table => self.table.as_ref().and(self.rich),
+            RichKind::Board => None,
         }
+    }
+
+    /// "3 columns · 9 cards" for a board, for the toolbar.
+    pub fn board_summary(&self) -> Option<String> {
+        self.board.as_ref().map(|b| b.summary())
     }
 
     pub fn can_toggle_page(&self) -> bool {
@@ -334,6 +359,11 @@ impl Viewer {
 
     /// Switches between the rendered page and numbered source lines.
     pub fn toggle_page(&mut self, cx: &mut Context<Self>) {
+        if let Some(board) = self.board.as_mut() {
+            board.visible = !board.visible;
+            cx.notify();
+            return;
+        }
         match self.rich {
             Some(RichKind::Json) => match self.raw.take() {
                 Some(raw) => self.swap_doc(raw),
@@ -450,6 +480,7 @@ impl Viewer {
         if self.preview.is_some() {
             self.preview = self.build_preview();
         }
+        self.reparse_board();
         if let Some(filter) = self.filter.as_mut() {
             filter.stick_to_bottom = at_bottom;
             self.run_filter(cx);
@@ -1065,6 +1096,8 @@ impl Viewer {
     }
 }
 
+impl EventEmitter<BoardEdited> for Viewer {}
+
 impl Focusable for Viewer {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
@@ -1088,6 +1121,7 @@ impl Render for Viewer {
         self.apply_pending_scroll(window, cx);
         let theme = cx.theme();
         let (muted, border) = (theme.muted_foreground, theme.border);
+        let showing_board = self.board.as_ref().is_some_and(|b| b.visible);
 
         let list = uniform_list(
             "rows",
@@ -1147,8 +1181,9 @@ impl Render for Viewer {
                         .child(div().text_xs().text_color(muted).child("⏎ next · ⇧⏎ previous · esc close")),
                 )
             })
-            .when_some(self.preview.clone(), |this, text| this.child(self.render_preview(text, cx)))
-            .when(self.preview.is_none(), |this| this.child(
+            .when(showing_board, |this| this.child(self.render_board(cx)))
+            .when_some(self.preview.clone().filter(|_| !showing_board), |this, text| this.child(self.render_preview(text, cx)))
+            .when(self.preview.is_none() && !showing_board, |this| this.child(
                 div()
                     .id("viewer")
                     .key_context("Viewer")

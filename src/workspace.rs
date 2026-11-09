@@ -31,7 +31,7 @@ use crate::session::{self, Session, SessionTab};
 use crate::text_index::{Bytes, Document};
 use crate::viewer::{RichKind, Viewer};
 use crate::{
-    AddFolder, CloseTab, CompareWithPrevious, FocusSearch, NewNote, NextTab, OpenFile, PrevTab, Quit, ReopenClosed, Save, SelectTab, ToggleEdit,
+    AddFolder, CloseTab, CompareWithPrevious, FocusSearch, NewBoard, NewNote, NextTab, OpenFile, PrevTab, Quit, ReopenClosed, Save, SelectTab, ToggleEdit,
     ToggleSidebar,
 };
 
@@ -77,6 +77,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-o", OpenFile, None),
         KeyBinding::new("cmd-shift-o", AddFolder, None),
         KeyBinding::new("cmd-n", NewNote, None),
+        KeyBinding::new("cmd-shift-n", NewBoard, None),
         KeyBinding::new("cmd-e", ToggleEdit, Some("Workspace")),
         KeyBinding::new("cmd-s", Save, Some("Workspace")),
         KeyBinding::new("cmd-w", CloseTab, Some("Workspace")),
@@ -113,6 +114,8 @@ enum TabState {
     Viewing {
         viewer: Entity<Viewer>,
         _changes: Subscription,
+        /// Board edits are saved as they happen.
+        _board_edits: Subscription,
     },
     Editing {
         editor: Entity<EditorState>,
@@ -944,7 +947,9 @@ impl Workspace {
         }
         // Repaint the status bar when the viewer's selection or progress changes.
         let changes = cx.observe(&viewer, |_, _, cx| cx.notify());
-        TabState::Viewing { viewer, _changes: changes }
+        let id = self.tabs[ix].id;
+        let board_edits = cx.subscribe(&viewer, move |this, _, _: &crate::viewer::BoardEdited, cx| this.save_board(id, cx));
+        TabState::Viewing { viewer, _changes: changes, _board_edits: board_edits }
     }
 
     /// Marks `id` most recently used and evicts tabs beyond `MAX_LIVE`.
@@ -1249,8 +1254,25 @@ impl Workspace {
         Ok(())
     }
 
+    /// A board was changed (card moved, added, ticked): write it now, so other
+    /// apps and agents see it. A file changed elsewhere in the meantime is
+    /// not overwritten; the toolbar shows the conflict and ⌘S asks.
+    fn save_board(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.set_dirty(id, true, cx);
+        match self.write_tab(id, false, cx) {
+            Ok(()) | Err(WriteError::Conflict) => {}
+            Err(WriteError::Failed(err)) => {
+                eprintln!("[leaf] could not save the board: {err}");
+                self.schedule_recovery(id, cx);
+            }
+        }
+    }
+
     /// Keeps a note's file name in step with its first line.
     fn rename_note(&mut self, ix: usize, text: &str) {
+        if crate::board::is_board(text) {
+            return; // a board's first line is its front matter
+        }
         let tab = &mut self.tabs[ix];
         let Some(target) = notes::renamed_path(&tab.path, &notes::name_from_text(text)) else { return };
         if std::fs::rename(&tab.path, &target).is_ok() {
@@ -1550,6 +1572,18 @@ impl Workspace {
             }
             Err(err) => {
                 let _ = window.prompt(PromptLevel::Critical, "Could not create a note", Some(&err.to_string()), &["OK"], cx);
+            }
+        }
+    }
+
+    fn on_new_board(&mut self, _: &NewBoard, window: &mut Window, cx: &mut Context<Self>) {
+        match notes::create_board() {
+            Ok(path) => {
+                self.search.update(cx, |state, cx| state.set_value("", window, cx));
+                self.open_paths(vec![path], cx);
+            }
+            Err(err) => {
+                let _ = window.prompt(PromptLevel::Critical, "Could not create a board", Some(&err.to_string()), &["OK"], cx);
             }
         }
     }
@@ -2053,6 +2087,9 @@ impl Workspace {
         let Some(tab) = self.active_tab() else { return (Vec::new(), None) };
         let mut details = Vec::new();
         if let TabState::Viewing { viewer, .. } = &tab.state {
+            if let Some(summary) = viewer.read(cx).board_summary() {
+                details.push(summary);
+            }
             let status = viewer.read(cx).status();
             if !status.is_empty() {
                 details.push(status);
@@ -2114,6 +2151,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_select_tab))
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_new_note))
+            .on_action(cx.listener(Self::on_new_board))
             .on_action(cx.listener(Self::on_compare_previous))
             .on_action(cx.listener(Self::on_focus_search))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {

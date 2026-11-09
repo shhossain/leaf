@@ -17,6 +17,7 @@ Leaf exists because CotEditor slows down with many files open, and TextEdit is n
 - **Pages.** Markdown renders as a page and `.txt` reads as wrapped prose. Minified JSON opens formatted, and CSV/TSV files open as a table. ⇧⌘V switches to the raw lines.
 - **Notes.** ⌘N (or ⌘T) creates a Markdown note in `~/Documents/Leaf Notes`. Notes save as you type and take their name from the first line.
 - **Encodings.** Shift_JIS, Windows-1252, UTF-16 and others are detected, and saving keeps the original encoding, BOM and line endings.
+- **Boards.** A Markdown file in the [Obsidian Kanban](https://github.com/mgmeyers/obsidian-kanban) format opens as columns of cards. Drag cards between columns, or use the keyboard. Every change is saved to the file right away, rewriting only the lines of the card that changed, so the same board works in Obsidian. ⇧⌘N makes a new board. See [Boards](#boards) for the format.
 - **Watched folders.** Add a folder to the sidebar (⇧⌘O, the **+ Folder** button, or drop a folder on the window) and its text files are listed like a Notes folder, newest first, with subfolders up to four levels deep. Hidden files, build folders such as `node_modules` and `target`, and binary files are left out. The folder is re-listed every 3 seconds while it is shown, and nothing is read until you open a file. Browsing a folder doesn't add its files to Open Files.
 - **Search.** The sidebar search (⇧⌘F) matches file names and the text inside every open file, or every file in the folder being shown, and shows the matching line. Opening a result jumps to it.
 - **Compare.** ⇧⌘D compares the current file with the one you viewed before it, side by side. ⌥-click a file in the sidebar to compare with that one.
@@ -28,6 +29,35 @@ Leaf exists because CotEditor slows down with many files open, and TextEdit is n
 | Code | Markdown | Editing a note |
 |---|---|---|
 | ![Code view](docs/screenshots/code.png) | ![Markdown view](docs/screenshots/markdown.png) | ![Editing](docs/screenshots/editing.png) |
+
+## Boards
+
+A board is an ordinary Markdown file. Columns are `##` headings and cards are task-list items:
+
+```md
+---
+
+kanban-plugin: board
+
+---
+
+## Todo
+
+- [ ] Write the parser #feature @{2026-11-20}
+    Extra lines of a card are indented four spaces.
+    - [x] checklist items show as progress on the card
+
+## Done
+
+**Complete**
+- [x] Finished card
+```
+
+- `#tag` shows as a label and `@{date}` as a due date.
+- Cards moved into a column marked `**Complete**` are ticked.
+- Anything after `***` (Obsidian's archive) and the `%% kanban:settings %%` block are kept but not shown.
+
+Coding agents such as Claude Code can manage a board by editing the file with their normal tools: add a `- [ ] ` line under a heading to create a card, move its lines to another heading to change its column, or change `[ ]` to `[x]` to tick it. Leaf reloads the file within a second or two and shows the change. If the board has unsaved changes in Leaf when that happens, Leaf flags the conflict instead of overwriting either side.
 
 ## Memory use
 
@@ -86,6 +116,7 @@ The script prints the previous app for each type, so you can switch back the sam
 | ⌘O | Open files |
 | ⇧⌘O | Add a folder to the sidebar |
 | ⌘N, ⌘T | New note |
+| ⇧⌘N | New board |
 | ⌘E, double-click | Edit / Done |
 | ⌘S | Save |
 | ⌘W | Close file |
@@ -103,6 +134,19 @@ The script prints the previous app for each type, so you can switch back the sam
 | ⌘↑, ⌘↓ | Top / bottom |
 | Esc | Close the find or filter bar |
 
+On a board:
+
+| Keys | Action |
+|---|---|
+| Arrows | Select a card |
+| ⌥ + arrows | Move the card |
+| Return, double-click | Edit the card's title |
+| N | New card in the column |
+| Space | Tick or untick |
+| ⌘⌫ | Delete the card |
+| ⌘Z | Undo |
+| ⇧⌘V | Board / Markdown source |
+
 ## How it works
 
 Leaf is written in Rust on [GPUI](https://github.com/zed-industries/zed), the GPU-rendered UI framework from Zed, and [gpui-component](https://github.com/longbridge/gpui-component).
@@ -119,6 +163,7 @@ The viewer does not use a text editor widget. It keeps the file's bytes plus the
 | `src/encoding.rs` | Encoding detection and round-trip on save |
 | `src/file_list.rs` | Sidebar dates, preview lines, content search |
 | `src/folders.rs` | Listing watched folders |
+| `src/board.rs`, `src/board_ui.rs` | Kanban boards: parsing and edits, and the board view |
 | `src/recovery.rs` | Copies of unsaved edits |
 | `src/notes.rs` | Notes folder, auto-naming |
 | `src/style.rs` | Colors |

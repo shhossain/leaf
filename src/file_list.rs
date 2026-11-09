@@ -47,7 +47,8 @@ pub fn peek(path: &Path) -> FileMeta {
         }
     }
     let text = String::from_utf8_lossy(&encoding::decode(buf).utf8).into_owned();
-    FileMeta { modified, snippet: first_line(&text), binary: false }
+    let snippet = if crate::board::is_board(&text) { "Board".to_string() } else { first_line(&text) };
+    FileMeta { modified, snippet, binary: false }
 }
 
 /// Searches inside a file for the sidebar's content search: returns the
