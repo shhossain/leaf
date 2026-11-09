@@ -4,7 +4,7 @@
 <dict>
 	<key>CFBundleName</key><string>Leaf</string>
 	<key>CFBundleDisplayName</key><string>Leaf</string>
-	<key>CFBundleIdentifier</key><string>dev.local.leaf</string>
+	<key>CFBundleIdentifier</key><string>io.github.shhossain.leaf</string>
 	<key>CFBundleExecutable</key><string>leaf</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
 	<key>CFBundleShortVersionString</key><string>0.1.0</string>

@@ -164,6 +164,13 @@ impl DocTab {
     }
 }
 
+/// One entry in the virtualized sidebar list.
+#[derive(Clone, PartialEq)]
+enum SidebarItem {
+    Header { label: SharedString, first: bool },
+    File { ix: usize, separator: bool },
+}
+
 pub struct Workspace {
     tabs: Vec<DocTab>,
     active: Option<u64>,
@@ -174,6 +181,8 @@ pub struct Workspace {
     next_id: u64,
     focus: FocusHandle,
     sidebar_open: bool,
+    sidebar_list: ListState,
+    sidebar_items: Vec<SidebarItem>,
     search: Entity<InputState>,
     _search_events: Subscription,
     title: SharedString,
@@ -219,6 +228,8 @@ impl Workspace {
             next_id: 1,
             focus,
             sidebar_open: true,
+            sidebar_list: ListState::new(0, ListAlignment::Top, px(400.)),
+            sidebar_items: Vec::new(),
             search,
             _search_events: search_events,
             title: SharedString::default(),
@@ -926,59 +937,74 @@ impl Workspace {
             .on_click(cx.listener(|this, _, window, cx| this.on_toggle_sidebar(&ToggleSidebar, window, cx)))
     }
 
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let dark = theme.mode.is_dark();
-        let (muted, border, sidebar_bg, hover_bg) = (theme.muted_foreground, theme.border, theme.sidebar, theme.secondary);
-        let (sidebar_border, search_bg) = (theme.sidebar_border, theme.input.opacity(0.55));
-        let separator = border.opacity(0.45);
-        let (selected_bg, selected_fg) = style::selection_row(dark);
+    /// The sidebar's rows in display order: date-group headers and files,
+    /// filtered by the search box. Cheap; recomputed every render.
+    fn sidebar_items(&self, cx: &App) -> Vec<SidebarItem> {
         let now = chrono::Local::now();
         let query = self.search.read(cx).value().to_lowercase();
-
-        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut items = Vec::new();
         let mut current_group: Option<String> = None;
-        // Thin inset lines between rows, hidden next to the highlighted one (like Notes).
         let mut previous_selected: Option<bool> = None;
         for ix in self.display_order() {
             let tab = &self.tabs[ix];
-            let folder = tab.folder();
-            let snippet = tab.meta.as_ref().map(|m| m.snippet.as_str()).unwrap_or("");
-            if !query.is_empty()
-                && ![tab.title.as_ref(), folder.as_str(), snippet].iter().any(|s| s.to_lowercase().contains(&query))
-            {
-                continue;
+            if !query.is_empty() {
+                let snippet = tab.meta.as_ref().map(|m| m.snippet.as_str()).unwrap_or("");
+                let haystacks = [tab.title.as_ref(), tab.folder().as_str(), snippet].map(str::to_lowercase);
+                if !haystacks.iter().any(|s| s.contains(&query)) {
+                    continue;
+                }
             }
-            let modified = tab.modified().map(file_list::local);
-            let group = modified.map(|m| file_list::group_label(m, now)).unwrap_or_else(|| "Today".into());
+            let group = tab
+                .modified()
+                .map(|m| file_list::group_label(file_list::local(m), now))
+                .unwrap_or_else(|| "Today".into());
             if current_group.as_ref() != Some(&group) {
-                rows.push(
-                    div()
-                        .px_3()
-                        .pt(if current_group.is_none() { px(6.) } else { px(16.) })
-                        .pb_1()
-                        .text_base()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(group.clone())
-                        .into_any_element(),
-                );
+                items.push(SidebarItem::Header { label: group.clone().into(), first: current_group.is_none() });
                 current_group = Some(group);
                 previous_selected = None;
             }
-
-            let id = tab.id;
-            let selected = Some(id) == self.active;
-            if previous_selected == Some(false) && !selected {
-                rows.push(div().mx_3().h(px(1.)).bg(separator).into_any_element());
-            } else if previous_selected.is_some() {
-                rows.push(div().h(px(1.)).into_any_element());
-            }
+            let selected = Some(tab.id) == self.active;
+            // Thin inset lines between rows, hidden next to the highlighted one (like Notes).
+            let separator = previous_selected == Some(false) && !selected;
             previous_selected = Some(selected);
-            let row_group: SharedString = format!("row-{id}").into();
-            let sub_color = if selected { selected_fg.opacity(0.75) } else { muted };
-            let date = modified.map(|m| file_list::row_date(m, now)).unwrap_or_default();
-            let title = if tab.dirty { format!("● {}", tab.title) } else { tab.title.to_string() };
-            rows.push(
+            items.push(SidebarItem::File { ix, separator });
+        }
+        items
+    }
+
+    fn render_sidebar_item(&self, item_ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(item) = self.sidebar_items.get(item_ix).cloned() else { return div().into_any_element() };
+        let (ix, separator) = match item {
+            SidebarItem::Header { label, first } => {
+                return div()
+                    .w_full()
+                    .px_5()
+                    .pt(if first { px(6.) } else { px(16.) })
+                    .pb_1()
+                    .text_base()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(label)
+                    .into_any_element();
+            }
+            SidebarItem::File { ix, separator } => (ix, separator),
+        };
+        let Some(tab) = self.tabs.get(ix) else { return div().into_any_element() };
+        let theme = cx.theme();
+        let (muted, hover_bg, separator_color) = (theme.muted_foreground, theme.secondary, theme.border.opacity(0.45));
+        let (selected_bg, selected_fg) = style::selection_row(theme.mode.is_dark());
+        let id = tab.id;
+        let selected = Some(id) == self.active;
+        let row_group: SharedString = format!("row-{id}").into();
+        let sub_color = if selected { selected_fg.opacity(0.75) } else { muted };
+        let date = tab.modified().map(|m| file_list::row_date(file_list::local(m), chrono::Local::now())).unwrap_or_default();
+        let snippet = tab.meta.as_ref().map(|m| m.snippet.clone()).unwrap_or_default();
+        let title = if tab.dirty { format!("● {}", tab.title) } else { tab.title.to_string() };
+        // `list` doesn't stretch its items; give each one the full width.
+        v_flex()
+            .w_full()
+            .px_2()
+            .child(div().mx_3().h(px(1.)).when(separator, |line| line.bg(separator_color)))
+            .child(
                 v_flex()
                     .id(("file", id as usize))
                     .group(row_group.clone())
@@ -997,7 +1023,7 @@ impl Workspace {
                             .text_xs()
                             .min_w_0()
                             .child(div().flex_none().child(date))
-                            .child(div().min_w_0().truncate().text_color(sub_color).child(snippet.to_string())),
+                            .child(div().min_w_0().truncate().text_color(sub_color).child(snippet)),
                     )
                     .child(
                         h_flex()
@@ -1005,7 +1031,7 @@ impl Workspace {
                             .text_xs()
                             .text_color(sub_color)
                             .child(Icon::new(IconName::Folder).xsmall())
-                            .child(div().truncate().child(folder)),
+                            .child(div().truncate().child(tab.folder())),
                     )
                     .child(
                         div()
@@ -1024,11 +1050,25 @@ impl Workspace {
                                 cx.stop_propagation();
                                 this.close_tab(id, window, cx);
                             })),
-                    )
-                    .into_any_element(),
-            );
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Only rows on screen are built and laid out (gpui's `list`), so 500
+        // open files cost about as much as 20.
+        let items = self.sidebar_items(cx);
+        if items != self.sidebar_items {
+            let old = self.sidebar_list.item_count();
+            self.sidebar_list.splice(0..old, items.len()); // keeps the scroll position
+            self.sidebar_items = items;
         }
-        let empty = rows.is_empty();
+        let theme = cx.theme();
+        let (muted, sidebar_bg, sidebar_border, search_bg) =
+            (theme.muted_foreground, theme.sidebar, theme.sidebar_border, theme.input.opacity(0.55));
+        let empty = self.sidebar_items.is_empty();
+        let searching = !self.search.read(cx).value().is_empty();
 
         v_flex()
             .w(px(SIDEBAR_WIDTH))
@@ -1058,19 +1098,18 @@ impl Workspace {
                     ),
                 ),
             )
+            .when(empty, |sidebar| {
+                let text = if searching { "No Matches" } else { "No Open Files" };
+                sidebar.child(div().pt_10().w_full().text_center().text_color(muted).child(text))
+            })
             .child(
-                div()
-                    .id("file-list")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px_2()
-                    .pb_3()
-                    .children(rows)
-                    .when(empty, |list| {
-                        let text = if query.is_empty() { "No Open Files" } else { "No Matches" };
-                        list.child(div().pt_10().w_full().text_center().text_color(muted).child(text))
-                    }),
+                list(
+                    self.sidebar_list.clone(),
+                    cx.processor(|this, ix: usize, _, cx| this.render_sidebar_item(ix, cx)),
+                )
+                .flex_1()
+                .min_h_0()
+                .pb_3(),
             )
     }
 

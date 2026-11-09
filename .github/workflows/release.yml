@@ -1,0 +1,37 @@
+name: Release
+
+# Push a tag like v0.2.0 to build Leaf.app and publish it as a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15 # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain from rust-toolchain.toml
+        run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Build Leaf.app
+        run: VERSION="${GITHUB_REF_NAME#v}" ./scripts/bundle.sh
+
+      - name: Zip
+        run: ditto -c -k --keepParent dist/Leaf.app "dist/Leaf-${GITHUB_REF_NAME}-macos-arm64.zip"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.zip \
+            --title "Leaf ${GITHUB_REF_NAME}" \
+            --generate-notes
