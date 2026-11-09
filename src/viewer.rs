@@ -13,7 +13,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, h_flex,
     input::{Input, InputEvent, InputState},
     scroll::Scrollbar,
-    text::{SelectionFormat, TextView},
+    text::{SelectionFormat, TextView, TextViewState},
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -24,6 +24,8 @@ use crate::highlight::{self, CHUNK, Spans};
 
 #[path = "board_ui.rs"]
 mod board_ui;
+#[path = "page.rs"]
+mod page;
 pub use board_ui::BoardEdited;
 use board_ui::BoardState;
 use crate::text_index::{Bytes, DisplayLine, Document};
@@ -32,9 +34,27 @@ actions!(
     viewer,
     [
         LineUp, LineDown, PageUp, PageDown, Top, Bottom, CopySelection, SelectAllText, Find,
-        FindNext, FindPrev, GoToLine, Dismiss, TogglePreview, FilterLines
+        FindNext, FindPrev, GoToLine, Dismiss, TogglePreview, FilterLines, ZoomIn, ZoomOut, ZoomReset, ToggleWrap
     ]
 );
+
+/// Text size, in percent, shared by every viewer (⌘+ / ⌘−; kept in the session).
+static FONT_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
+
+pub fn font_scale_percent() -> u32 {
+    FONT_SCALE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_font_scale_percent(percent: u32) {
+    FONT_SCALE.store(percent.clamp(60, 250), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn font_scale() -> f32 {
+    font_scale_percent() as f32 / 100.
+}
+
+/// Wrapped view of code and logs (⌥Z) is a page; bigger files keep their lines.
+const MAX_WRAP_BYTES: usize = 1024 * 1024;
 
 /// Highlighted chunks kept around for scrolling back and forth.
 const CHUNK_CACHE: usize = 8;
@@ -165,7 +185,54 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-l", FilterLines, root),
         KeyBinding::new("cmd-shift-v", TogglePreview, root),
         KeyBinding::new("escape", Dismiss, Some("ViewerBar")),
+        KeyBinding::new("cmd-=", ZoomIn, root),
+        KeyBinding::new("cmd-+", ZoomIn, root),
+        KeyBinding::new("cmd--", ZoomOut, root),
+        KeyBinding::new("cmd-0", ZoomReset, root),
+        KeyBinding::new("alt-z", ToggleWrap, root),
     ]);
+}
+
+/// A link in a rendered Markdown page was clicked.
+#[derive(Action, Clone, PartialEq, serde::Deserialize)]
+#[action(namespace = viewer, no_json)]
+pub struct OpenLink(pub String);
+
+/// A file reference was ⌘-clicked (or a relative Markdown link): the
+/// workspace opens it, at `line` (1-based) when given.
+pub struct OpenLocation {
+    pub path: PathBuf,
+    pub line: Option<usize>,
+}
+
+/// The word or path under byte column `col`: a run without spaces, quotes or
+/// brackets, with trailing punctuation removed (`src/a.rs:12:5`, `https://…`).
+fn link_token(line: &str, col: usize) -> Option<&str> {
+    let is_break = |c: char| c.is_whitespace() || "\"'`()<>[]{},|=;".contains(c);
+    let col = col.min(line.len());
+    if !line.is_char_boundary(col) {
+        return None;
+    }
+    let start = line[..col].rfind(is_break).map_or(0, |i| i + line[i..].chars().next().map_or(1, char::len_utf8));
+    let end = line[col..].find(is_break).map_or(line.len(), |i| col + i);
+    let token = line[start..end].trim_end_matches(['.', ':', '!', '?']);
+    (!token.is_empty()).then_some(token)
+}
+
+/// `a/b.rs:42:7` → (`a/b.rs`, Some(42)).
+fn split_reference(token: &str) -> (&str, Option<usize>) {
+    let mut path = token;
+    let mut line = None;
+    for _ in 0..2 {
+        match path.rsplit_once(':') {
+            Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => {
+                line = tail.parse().ok().or(line);
+                path = head;
+            }
+            _ => break,
+        }
+    }
+    (path, line)
 }
 
 /// A position in the source: line, and byte column within that line.
@@ -248,6 +315,14 @@ pub struct Viewer {
     note: bool,
     /// The file is a Kanban board: shown as columns of cards.
     board: Option<BoardState>,
+    /// The rendered page's state and the text it shows.
+    page_state: Option<(SharedString, Entity<TextViewState>)>,
+    /// Code or log shown wrapped, as a page (⌥Z).
+    wrap: bool,
+    /// Plain files (logs): tint ERROR / WARN / DEBUG lines.
+    log_levels: bool,
+    /// (document, words) for the toolbar's word count.
+    word_cache: std::cell::Cell<Option<(usize, usize)>>,
 }
 
 impl Viewer {
@@ -255,6 +330,7 @@ impl Viewer {
         let syntax = (doc.len() <= highlight::MAX_HIGHLIGHT_BYTES)
             .then(|| highlight::find_syntax(path, &doc.text(doc.line_range(0))))
             .flatten();
+        let log_levels = syntax.is_none() && rich_kind(path).is_none();
         let mut this = Self {
             doc,
             focus: cx.focus_handle(),
@@ -287,6 +363,10 @@ impl Viewer {
             table: None,
             note: crate::notes::is_note(path),
             board: None,
+            page_state: None,
+            wrap: false,
+            log_levels,
+            word_cache: std::cell::Cell::new(None),
         };
         if this.rich == Some(RichKind::Markdown) {
             this.board = BoardState::detect(&this.doc);
@@ -320,11 +400,14 @@ impl Viewer {
 
     fn build_preview(&self) -> Option<SharedString> {
         let text = || self.doc.text(0..self.doc.len());
+        if self.wrap && self.rich.is_none() {
+            return (self.doc.len() <= MAX_WRAP_BYTES).then(|| plain_to_markdown(&text()).into());
+        }
         match self.rich? {
             RichKind::Markdown if self.doc.len() <= MAX_PREVIEW_BYTES => Some(if self.note {
-                note_markdown(&text()).into()
+                page::taskify(&note_markdown(&text())).into()
             } else {
-                text().into_owned().into()
+                page::taskify(&text()).into()
             }),
             RichKind::Prose if self.doc.len() <= MAX_PROSE_BYTES => Some(plain_to_markdown(&text()).into()),
             _ => None,
@@ -415,14 +498,49 @@ impl Viewer {
         self.pending_scroll = Some((0, false));
     }
 
-    fn render_preview(&self, text: SharedString, cx: &mut Context<Self>) -> impl IntoElement {
+    fn on_zoom_in(&mut self, _: &ZoomIn, _: &mut Window, cx: &mut Context<Self>) {
+        set_font_scale_percent(font_scale_percent() + 10);
+        cx.notify();
+    }
+
+    fn on_zoom_out(&mut self, _: &ZoomOut, _: &mut Window, cx: &mut Context<Self>) {
+        set_font_scale_percent(font_scale_percent().saturating_sub(10));
+        cx.notify();
+    }
+
+    fn on_zoom_reset(&mut self, _: &ZoomReset, _: &mut Window, cx: &mut Context<Self>) {
+        set_font_scale_percent(100);
+        cx.notify();
+    }
+
+    /// ⌥Z: code and logs wrapped to the window (as a page), or back to lines.
+    fn on_toggle_wrap(&mut self, _: &ToggleWrap, _: &mut Window, cx: &mut Context<Self>) {
+        if self.rich.is_some() || self.doc.len() > MAX_WRAP_BYTES {
+            return; // pages already wrap; huge files keep their lines
+        }
+        self.wrap = !self.wrap;
+        self.preview = if self.wrap { self.build_preview() } else { None };
+        cx.notify();
+    }
+
+    fn render_preview(&self, state: Entity<TextViewState>, cx: &mut Context<Self>) -> impl IntoElement {
         let base = self.base_dir.clone();
+        let size = cx.theme().font_size * font_scale();
+        let mono = self.wrap.then(|| cx.theme().mono_font_family.clone());
         div()
             .id("preview")
+            .text_size(size)
+            .when_some(mono, |el, family| el.font_family(family))
             // Double-click anywhere on the page to start editing, like Notes.
+            .on_action(cx.listener(Self::on_open_link))
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                window.focus(&this.focus, cx);
                 if event.click_count == 2 {
-                    this.request_edit(None, window, cx);
+                    // The page selects the word first; read it on the next frame.
+                    cx.spawn_in(window, async move |this, cx| {
+                        this.update_in(cx, |this, window, cx| this.edit_at_page_selection(window, cx)).ok();
+                    })
+                    .detach();
                 }
             }))
             .key_context("Viewer")
@@ -430,7 +548,8 @@ impl Viewer {
             .flex_1()
             .min_h_0()
             .child(
-                TextView::markdown(("markdown", cx.entity_id().as_u64() as usize), text)
+                TextView::new(&state)
+                    .on_link_click(|url, _, window, cx| window.dispatch_action(Box::new(OpenLink(url.to_string())), cx))
                     .selectable(true)
                     .selection_format(SelectionFormat::Plain)
                     .scrollable(true)
@@ -563,8 +682,11 @@ impl Viewer {
     }
 
     /// One-line summary for the status bar.
-    pub fn status(&self) -> String {
+    pub fn status(&self, cx: &App) -> String {
         let mut parts = Vec::new();
+        if let Some(words) = self.word_status(cx).filter(|_| self.preview.is_some()) {
+            parts.push(words);
+        }
         if let Some((start, end)) = self.selection() {
             let chars = end.line - start.line + 1;
             parts.push(if start.line == end.line {
@@ -628,6 +750,18 @@ impl Viewer {
 
         let selection = self.selection();
         let find = self.find.as_ref().map(|f| (f.matches.clone(), f.current));
+        // A selected word is marked wherever else it appears on screen.
+        let word: Option<Vec<u8>> = selection.filter(|(s, e)| s.line == e.line && e.col > s.col + 1).and_then(|(s, e)| {
+            let text = self.doc.slice(self.doc.line_range(s.line));
+            let word = text.get(s.col..e.col)?.to_vec();
+            (word.len() <= 64 && word.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b >= 0x80)).then_some(word)
+        });
+        let word_bg = theme.selection.opacity(0.45);
+        let dark = theme.mode.is_dark();
+        let level_colors = [
+            if dark { rgb(0xf28b82) } else { rgb(0xc5221f) },
+            if dark { rgb(0xf0cf7a) } else { rgb(0x8a6212) },
+        ];
         let lines: Vec<(usize, Range<usize>)> = match self.filtered() {
             Some(filtered) => filtered
                 .get(range.start.min(filtered.len())..range.end.min(filtered.len()))
@@ -652,7 +786,28 @@ impl Viewer {
                 }
             }
 
+            if self.log_levels && colors.is_empty() {
+                if let Some(level) = log_level(&self.doc.slice(source.start..(source.start + 256).min(source.end))) {
+                    let color = match level {
+                        LogLevel::Error => level_colors[0].into(),
+                        LogLevel::Warn => level_colors[1].into(),
+                        LogLevel::Debug => muted,
+                    };
+                    colors.push((0..display.text.len(), HighlightStyle { color: Some(color), ..Default::default() }));
+                }
+            }
+
             let mut backgrounds = Vec::new();
+            if let Some(word) = &word {
+                let text = self.doc.slice(source.clone());
+                let is_word = |b: Option<&u8>| b.is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+                for at in memchr::memmem::find_iter(&text, word) {
+                    let selected_here = selection.is_some_and(|(s, _)| s.line == line && s.col == at);
+                    if !selected_here && !is_word(at.checked_sub(1).and_then(|i| text.get(i))) && !is_word(text.get(at + word.len())) {
+                        backgrounds.push((to_display(at..at + word.len()), word_bg));
+                    }
+                }
+            }
             if let Some((matches, current)) = &find {
                 let first = matches.partition_point(|m| m.end <= source.start);
                 for (ix, m) in matches.iter().enumerate().skip(first) {
@@ -757,6 +912,59 @@ impl Viewer {
         (range.start + pos.col).min(range.end)
     }
 
+    fn open_reference_at(&mut self, pos: Pos, cx: &mut Context<Self>) -> bool {
+        let line = self.doc.text(self.doc.line_range(pos.line)).into_owned();
+        let Some(token) = link_token(&line, pos.col) else { return false };
+        self.open_reference(token, cx)
+    }
+
+    /// Opens a URL in the browser, or a file path (relative to this file's
+    /// folder or any folder above it) in Leaf.
+    fn open_reference(&mut self, token: &str, cx: &mut Context<Self>) -> bool {
+        if ["http://", "https://", "mailto:"].iter().any(|p| token.starts_with(p)) {
+            cx.open_url(token);
+            return true;
+        }
+        let token = token.split('#').next().unwrap_or(token).replace("%20", " ");
+        let (path, line) = split_reference(&token);
+        let path = path.strip_prefix("file://").unwrap_or(path);
+        let candidates: Vec<PathBuf> = if let Some(rest) = path.strip_prefix("~/") {
+            dirs::home_dir().map(|h| h.join(rest)).into_iter().collect()
+        } else if Path::new(path).is_absolute() {
+            vec![PathBuf::from(path)]
+        } else {
+            self.base_dir.ancestors().take(8).map(|dir| dir.join(path.trim_start_matches("./"))).collect()
+        };
+        match candidates.into_iter().find(|p| p.is_file()) {
+            Some(path) => {
+                cx.emit(OpenLocation { path, line });
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn on_open_link(&mut self, link: &OpenLink, _: &mut Window, cx: &mut Context<Self>) {
+        let target = link.0.clone();
+        if let Some(line) = Self::task_link(&target) {
+            self.toggle_task(line, cx);
+            return;
+        }
+        if !self.open_reference(&target, cx) && target.contains("://") {
+            cx.open_url(&target);
+        }
+    }
+
+    /// Shows `line` (0-based): scrolls the line view, or the rendered page.
+    pub fn go_to_line(&mut self, line: usize, cx: &mut Context<Self>) {
+        if self.preview.is_some() && self.reveal_in_page(line, cx) {
+            return;
+        }
+        self.flash_line = Some(line);
+        self.pending_scroll = Some((line, true));
+        cx.notify();
+    }
+
     fn hit_test(&self, point: Point<Pixels>, window: &mut Window) -> Pos {
         let (bounds, offset) = {
             let state = self.scroll.0.borrow();
@@ -792,6 +1000,10 @@ impl Viewer {
     fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
         let pos = self.hit_test(event.position, window);
+        // ⌘-click opens a URL or a file reference (`src/main.rs:42`).
+        if event.modifiers.platform && event.click_count == 1 && self.open_reference_at(pos, cx) {
+            return;
+        }
         self.flash_line = None;
         match event.click_count {
             2 => {
@@ -897,6 +1109,10 @@ impl Viewer {
     // ── find ───────────────────────────────────────────────────────────────
 
     fn on_find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        if self.board.as_ref().is_some_and(|b| b.visible) {
+            self.focus_board_filter(window, cx);
+            return;
+        }
         self.preview = None; // find works on lines: show the source
         self.filter = None;
         if self.find.is_none() {
@@ -1097,6 +1313,7 @@ impl Viewer {
 }
 
 impl EventEmitter<BoardEdited> for Viewer {}
+impl EventEmitter<OpenLocation> for Viewer {}
 
 impl Focusable for Viewer {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -1108,8 +1325,8 @@ impl Render for Viewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         self.font = font(theme.mono_font_family.clone());
-        self.font_size = theme.mono_font_size;
-        self.row_height = (theme.mono_font_size * 1.5).round();
+        self.font_size = theme.mono_font_size * font_scale();
+        self.row_height = (self.font_size * 1.5).round();
         let digits = self.doc.line_count().to_string().len().max(3) as f32;
         let char_width = window
             .text_system()
@@ -1119,9 +1336,10 @@ impl Render for Viewer {
         self.gutter_width = char_width * (digits + 3.);
         self.char_width = char_width;
         self.apply_pending_scroll(window, cx);
+        let showing_board = self.board.as_ref().is_some_and(|b| b.visible);
+        let page = self.preview.clone().filter(|_| !showing_board).map(|text| self.page_state(&text, cx));
         let theme = cx.theme();
         let (muted, border) = (theme.muted_foreground, theme.border);
-        let showing_board = self.board.as_ref().is_some_and(|b| b.visible);
 
         let list = uniform_list(
             "rows",
@@ -1146,6 +1364,10 @@ impl Render for Viewer {
             .on_action(cx.listener(Self::on_goto))
             .on_action(cx.listener(Self::on_dismiss))
             .on_action(cx.listener(Self::on_toggle_preview))
+            .on_action(cx.listener(Self::on_zoom_in))
+            .on_action(cx.listener(Self::on_zoom_out))
+            .on_action(cx.listener(Self::on_zoom_reset))
+            .on_action(cx.listener(Self::on_toggle_wrap))
             .on_action(cx.listener(Self::on_filter))
             .when_some(self.goto.as_ref(), |this, goto| {
                 this.child(self.render_bar(Input::new(&goto.input).small(), cx))
@@ -1181,8 +1403,8 @@ impl Render for Viewer {
                         .child(div().text_xs().text_color(muted).child("⏎ next · ⇧⏎ previous · esc close")),
                 )
             })
-            .when(showing_board, |this| this.child(self.render_board(cx)))
-            .when_some(self.preview.clone().filter(|_| !showing_board), |this, text| this.child(self.render_preview(text, cx)))
+            .when(showing_board, |this| this.child(self.render_board(window, cx)))
+            .when_some(page, |this, state| this.child(self.render_preview(state, cx)))
             .when(self.preview.is_none() && !showing_board, |this| this.child(
                 div()
                     .id("viewer")
@@ -1209,6 +1431,27 @@ impl Render for Viewer {
                     .when(self.filtered().is_none_or(|l| !l.is_empty()), |this| this.child(list))
                     .child(Scrollbar::new(&self.scroll)),
             ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LogLevel {
+    Error,
+    Warn,
+    Debug,
+}
+
+/// The level of a log line, from the words near its start: ERROR, WARN, DEBUG…
+fn log_level(head: &[u8]) -> Option<LogLevel> {
+    let has = |word: &[u8]| memchr::memmem::find(head, word).is_some();
+    if has(b"ERROR") || has(b"FATAL") || has(b"PANIC") || has(b"CRITICAL") || has(b"panicked") || has(b"[E]") || has(b"error:") {
+        Some(LogLevel::Error)
+    } else if has(b"WARN") || has(b"[W]") || has(b"warning:") {
+        Some(LogLevel::Warn)
+    } else if has(b"DEBUG") || has(b"TRACE") {
+        Some(LogLevel::Debug)
+    } else {
+        None
     }
 }
 
@@ -1395,7 +1638,7 @@ fn compose(
 
 #[cfg(test)]
 mod tests {
-    use super::{compose, search};
+    use super::{LogLevel, compose, link_token, log_level, search, split_reference};
     use crate::text_index::Document;
     use gpui_kit::HighlightStyle;
 
@@ -1448,6 +1691,24 @@ mod tests {
         assert_eq!(out, "{\n  \"z\": 1,\n  \"a\": [\n    true,\n    null\n  ]\n}\n");
         let bad = Document::new(Bytes::Owned(b"{nope".to_vec()), true);
         assert!(super::pretty_json(&bad).is_none());
+    }
+
+    #[test]
+    fn reads_log_levels() {
+        assert_eq!(log_level(b"2026-11-10 12:00:01 ERROR db: timeout"), Some(LogLevel::Error));
+        assert_eq!(log_level(b"[W] disk 91% full"), Some(LogLevel::Warn));
+        assert_eq!(log_level(b"DEBUG cache hit"), Some(LogLevel::Debug));
+        assert_eq!(log_level(b"INFO started"), None);
+    }
+
+    #[test]
+    fn finds_references_under_the_cursor() {
+        let line = "error --> src/main.rs:12:5, see https://example.com/x.";
+        assert_eq!(link_token(line, 14), Some("src/main.rs:12:5"));
+        assert_eq!(link_token(line, 40), Some("https://example.com/x"));
+        assert_eq!(split_reference("src/main.rs:12:5"), ("src/main.rs", Some(12)));
+        assert_eq!(split_reference("notes.md"), ("notes.md", None));
+        assert_eq!(link_token("   ", 1), None);
     }
 
     #[test]

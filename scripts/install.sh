@@ -10,3 +10,11 @@ LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchService
 $LSREG -u dist/Leaf.app 2>/dev/null || true     # Finder should only know the installed copy
 $LSREG -f /Applications/Leaf.app
 echo "Installed /Applications/Leaf.app"
+# The `leaf` command: /usr/local/bin if writable, else ~/.local/bin (if it exists).
+for dir in /usr/local/bin "$HOME/.local/bin"; do
+  if [[ -d $dir && -w $dir ]]; then
+    ln -sf /Applications/Leaf.app/Contents/Resources/leaf "$dir/leaf"
+    echo "Installed $dir/leaf"
+    break
+  fi
+done

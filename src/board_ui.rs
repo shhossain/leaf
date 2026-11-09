@@ -10,7 +10,7 @@ actions!(
     board,
     [
         SelectUp, SelectDown, SelectLeft, SelectRight, MoveCardUp, MoveCardDown, MoveCardLeft, MoveCardRight,
-        EditCard, ToggleCard, DeleteCard, NewCard, UndoBoard, CancelEdit
+        EditCard, ToggleCard, DeleteCard, NewCard, UndoBoard, CancelEdit, ClearFilter
     ]
 );
 
@@ -36,6 +36,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("n", NewCard, board),
         KeyBinding::new("cmd-z", UndoBoard, board),
         KeyBinding::new("escape", CancelEdit, Some("BoardEditing")),
+        KeyBinding::new("escape", ClearFilter, Some("BoardFilter")),
     ]);
 }
 
@@ -51,6 +52,8 @@ pub(super) struct BoardState {
     undo: Vec<String>,
     /// False for files Leaf can't write back exactly (odd encodings).
     editable: bool,
+    /// Shows only matching cards (⌘F): words, `#tag`, or `overdue`.
+    filter: Option<(Entity<InputState>, Subscription)>,
 }
 
 struct CardEdit {
@@ -63,6 +66,33 @@ struct CardEdit {
 enum EditTarget {
     Card(usize, usize),
     New(usize),
+    /// A column's name.
+    Lane(usize),
+    NewLane,
+}
+
+/// A column being dragged by its header.
+#[derive(Clone)]
+struct DraggedLane {
+    lane: usize,
+    title: SharedString,
+}
+
+impl Render for DraggedLane {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .px_3()
+            .py_1p5()
+            .rounded(px(8.))
+            .bg(theme.secondary)
+            .border_1()
+            .border_color(theme.caret)
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme.foreground)
+            .child(self.title.clone())
+    }
 }
 
 /// A card being dragged, and the picture under the pointer.
@@ -108,6 +138,7 @@ impl BoardState {
             editing: None,
             undo: Vec::new(),
             editable: !doc.lossy,
+            filter: None,
         })
     }
 
@@ -314,9 +345,18 @@ impl Viewer {
                 card.text.clone()
             }
             EditTarget::New(lane) if lane < state.board.lanes.len() => String::new(),
+            EditTarget::Lane(lane) => match state.board.lanes.get(lane) {
+                Some(lane) => lane.title.clone(),
+                None => return,
+            },
+            EditTarget::NewLane => String::new(),
             EditTarget::New(_) => return,
         };
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Card title  #tag  @{2026-12-31}").default_value(value));
+        let placeholder = match target {
+            EditTarget::Lane(_) | EditTarget::NewLane => "Column name",
+            _ => "Card title  #tag  @{2026-12-31}",
+        };
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).default_value(value));
         let events = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
             InputEvent::PressEnter { .. } => this.commit_card_edit(true, window, cx),
             InputEvent::Blur => this.commit_card_edit(false, window, cx),
@@ -340,6 +380,8 @@ impl Viewer {
             EditTarget::Card(lane, card) => {
                 self.apply_board(board::set_card_text(&text, lane, card, &value), Some((lane, card)), true, cx);
             }
+            EditTarget::Lane(lane) => self.apply_board(board::rename_lane(&text, lane, &value), None, true, cx),
+            EditTarget::NewLane => self.apply_board(board::add_lane(&text, &value), None, true, cx),
             EditTarget::New(lane) => {
                 let index = self.board.as_ref().map_or(0, |b| b.card_count(lane));
                 let added = board::add_card(&text, lane, &value);
@@ -363,6 +405,56 @@ impl Viewer {
         cx.notify();
     }
 
+    fn board_move_lane(&mut self, from: usize, before: Option<usize>, cx: &mut Context<Self>) {
+        if self.board_editable() {
+            let new = board::move_lane(&self.board_text(), from, before);
+            self.apply_board(new, None, true, cx);
+        }
+    }
+
+    fn board_delete_lane(&mut self, lane: usize, cx: &mut Context<Self>) {
+        if self.board_editable() {
+            let new = board::delete_lane(&self.board_text(), lane);
+            self.apply_board(new, None, true, cx);
+        }
+    }
+
+    /// ⌘F on a board: filter the cards.
+    pub(super) fn focus_board_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.board.as_mut() else { return };
+        let input = match &state.filter {
+            Some((input, _)) => input.clone(),
+            None => {
+                let input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter cards: words, #tag, overdue"));
+                let events = cx.subscribe(&input, |_, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        cx.notify();
+                    }
+                });
+                state.filter = Some((input.clone(), events));
+                input
+            }
+        };
+        input.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    fn set_board_filter(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_board_filter(window, cx);
+        if let Some((input, _)) = self.board.as_ref().and_then(|b| b.filter.as_ref()) {
+            input.update(cx, |input, cx| input.set_value(query.to_string(), window, cx));
+        }
+        window.focus(&self.focus, cx);
+    }
+
+    fn on_clear_filter(&mut self, _: &ClearFilter, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = self.board.as_mut() {
+            state.filter = None;
+        }
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
     /// The parsed board was replaced on disk (or reloaded): re-read it.
     pub(super) fn reparse_board(&mut self) {
         let text = self.board_text();
@@ -372,21 +464,35 @@ impl Viewer {
         }
     }
 
-    pub(super) fn render_board(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_board(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(state) = self.board.as_ref() else { return div().into_any_element() };
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let query = state.filter.as_ref().map(|(input, _)| input.read(cx).value().trim().to_lowercase()).unwrap_or_default();
+        let filter_focused = state.filter.as_ref().is_some_and(|(input, _)| input.read(cx).focus_handle(cx).is_focused(window));
+        let shows = |parts: &board::CardParts, card: &board::Card| -> bool {
+            if query.is_empty() {
+                return true;
+            }
+            query.split_whitespace().all(|word| match word {
+                "overdue" => !card.done && parts.date.as_deref().is_some_and(|d| board::is_overdue(d, &today)),
+                _ if word.starts_with('#') => parts.tags.iter().any(|t| t.to_lowercase() == word[1..]),
+                _ => card.text.to_lowercase().contains(word) || card.body.iter().any(|l| l.to_lowercase().contains(word)),
+            })
+        };
         let theme = cx.theme();
         let dark = theme.mode.is_dark();
         let (muted, card_bg, border, ring, fg) = (theme.muted_foreground, theme.muted, theme.border, theme.caret, theme.foreground);
         let drop_bg = theme.secondary;
         let (tag_bg, tag_fg) = if dark { (rgb(0x2e3a52), rgb(0xa9c1ee)) } else { (rgb(0xdde8fb), rgb(0x2b5aa8)) };
         let (date_bg, date_fg) = if dark { (rgb(0x4a3b1c), rgb(0xf0cf7a)) } else { (rgb(0xfbefd0), rgb(0x8a6212)) };
+        let (late_bg, late_fg) = if dark { (rgb(0x52262a), rgb(0xf28b82)) } else { (rgb(0xfde0de), rgb(0xb3261e)) };
         let editing_target = state.editing.as_ref().map(|e| e.target);
         let editable = state.editable;
 
         let chip = move |text: String, bg: Rgba, fg: Rgba| div().px(px(7.)).rounded(px(9.)).bg(bg).text_color(fg).child(text);
 
         let lanes = state.board.lanes.iter().enumerate().map(|(l, lane)| {
-            let cards = lane.cards.iter().enumerate().map(|(c, card)| {
+            let cards = lane.cards.iter().enumerate().filter(|(_, card)| shows(&board::card_parts(card), card)).map(|(c, card)| {
                 if editing_target == Some(EditTarget::Card(l, c)) {
                     let edit = state.editing.as_ref().expect("editing");
                     return div()
@@ -465,8 +571,18 @@ impl Viewer {
                                 .mt_1p5()
                                 .pl(px(22.))
                                 .text_xs()
-                                .children(parts.tags.iter().map(|t| chip(format!("#{t}"), tag_bg, tag_fg)))
-                                .when_some(parts.date.clone(), |el, date| el.child(chip(date, date_bg, date_fg))),
+                                .children(parts.tags.iter().enumerate().map(|(t_ix, t)| {
+                                    let query = format!("#{t}");
+                                    chip(query.clone(), tag_bg, tag_fg)
+                                        .id(("tag", (l * 100_000 + c) * 16 + t_ix.min(15)))
+                                        .cursor_pointer()
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .on_click(cx.listener(move |this, _, window, cx| this.set_board_filter(&query, window, cx)))
+                                }))
+                                .when_some(parts.date.clone(), |el, date| {
+                                    let late = !done && board::is_overdue(&date, &today);
+                                    el.child(if late { chip(date, late_bg, late_fg) } else { chip(date, date_bg, date_fg) })
+                                }),
                         )
                     })
                     .when_some(parts.note.clone(), |el, note| {
@@ -518,16 +634,59 @@ impl Viewer {
                             this.board_move(dragged.lane, dragged.card, l, None, cx);
                         }))
                 })
-                .child(
+                .child(if editing_target == Some(EditTarget::Lane(l)) {
+                    let edit = state.editing.as_ref().expect("editing");
+                    div()
+                        .key_context("BoardEditing")
+                        .p_1()
+                        .rounded(px(8.))
+                        .bg(card_bg)
+                        .border_2()
+                        .border_color(ring)
+                        .child(Input::new(&edit.input).small().appearance(false))
+                        .into_any_element()
+                } else {
+                    let lane_title: SharedString = lane.title.clone().into();
+                    let empty = lane.cards.is_empty();
                     h_flex()
+                        .id(("lane-head", l))
+                        .group(SharedString::from(format!("lane-head-{l}")))
                         .gap_2()
                         .px_1()
                         .pt_1()
                         .text_sm()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(lane.title.clone())
-                        .child(div().font_weight(FontWeight::NORMAL).text_color(muted).child(lane.cards.len().to_string())),
-                )
+                        .when(editable, |el| {
+                            el.on_drag(DraggedLane { lane: l, title: lane_title.clone() }, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+                                .drag_over::<DraggedLane>(move |style, _, _, _| style.bg(drop_bg))
+                                .on_drop(cx.listener(move |this, dragged: &DraggedLane, _, cx| this.board_move_lane(dragged.lane, Some(l), cx)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                        if event.click_count == 2 {
+                                            this.start_card_edit(EditTarget::Lane(l), window, cx);
+                                        }
+                                    }),
+                                )
+                        })
+                        .child(lane_title)
+                        .child(div().font_weight(FontWeight::NORMAL).text_color(muted).child(lane.cards.len().to_string()))
+                        .when(editable && empty, |el| {
+                            el.child(
+                                div()
+                                    .id(("delete-lane", l))
+                                    .ml_auto()
+                                    .px_1()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .invisible()
+                                    .group_hover(SharedString::from(format!("lane-head-{l}")), |s| s.visible())
+                                    .child("✕")
+                                    .on_click(cx.listener(move |this, _, _, cx| this.board_delete_lane(l, cx))),
+                            )
+                        })
+                        .into_any_element()
+                })
                 .child(
                     v_flex()
                         .id(("lane-cards", l))
@@ -547,7 +706,24 @@ impl Viewer {
         };
         v_flex()
             .id("board")
-            .key_context(if state.editing.is_some() { "BoardRoot" } else { "Board" })
+            .key_context(if state.editing.is_some() || filter_focused { "BoardRoot" } else { "Board" })
+            .on_action(cx.listener(Self::on_clear_filter))
+            .when_some(state.filter.as_ref().map(|(input, _)| input.clone()), |el, input| {
+                let shown: usize = state.board.lanes.iter().flat_map(|l| &l.cards).filter(|c| shows(&board::card_parts(c), c)).count();
+                el.child(
+                    h_flex()
+                        .key_context("BoardFilter")
+                        .gap_3()
+                        .mx(px(20.))
+                        .mt_1()
+                        .px_2()
+                        .h_8()
+                        .rounded(px(8.))
+                        .bg(card_bg)
+                        .child(div().flex_1().child(Input::new(&input).small().appearance(false)))
+                        .child(div().text_xs().text_color(muted).child(format!("{shown} cards  ·  esc clears"))),
+                )
+            })
             .track_focus(&self.focus)
             .size_full()
             .text_color(fg)
@@ -575,7 +751,35 @@ impl Viewer {
                     .px(px(20.))
                     .pt_2()
                     .pb_3()
-                    .children(lanes),
+                    .children(lanes)
+                    .when(editable, |el| {
+                        let adding = editing_target == Some(EditTarget::NewLane);
+                        el.child(
+                            div()
+                                .id("add-lane")
+                                .w(px(LANE_WIDTH * 0.75))
+                                .flex_none()
+                                .h(px(36.))
+                                .px_3()
+                                .py_2()
+                                .rounded(px(10.))
+                                .text_sm()
+                                .text_color(muted)
+                                .when(adding, |el| {
+                                    let edit = state.editing.as_ref().expect("editing");
+                                    el.key_context("BoardEditing").p_1().bg(card_bg).border_2().border_color(ring).child(
+                                        Input::new(&edit.input).small().appearance(false),
+                                    )
+                                })
+                                .when(!adding, |el| {
+                                    el.hover(move |style| style.bg(drop_bg))
+                                        .drag_over::<DraggedLane>(move |style, _, _, _| style.bg(drop_bg))
+                                        .on_drop(cx.listener(|this, dragged: &DraggedLane, _, cx| this.board_move_lane(dragged.lane, None, cx)))
+                                        .on_click(cx.listener(|this, _, window, cx| this.start_card_edit(EditTarget::NewLane, window, cx)))
+                                        .child("+ Add column")
+                                }),
+                        )
+                    }),
             )
             .child(
                 div()

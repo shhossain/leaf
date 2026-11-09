@@ -19,6 +19,15 @@ pub struct Session {
     /// The shown file when it came from a watched folder (not in `tabs`).
     #[serde(default)]
     pub folder_file: Option<PathBuf>,
+    /// Recently closed files, newest last (Quick Open lists them).
+    #[serde(default)]
+    pub recent: Vec<PathBuf>,
+    /// An opaque window instead of the translucent sidebar.
+    #[serde(default)]
+    pub solid: bool,
+    /// Text size in percent (⌘+ / ⌘−); 0 in old sessions means 100.
+    #[serde(default)]
+    pub zoom: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -26,6 +35,8 @@ pub struct SessionTab {
     pub path: PathBuf,
     #[serde(default)]
     pub top_line: usize,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 fn session_path() -> Option<PathBuf> {
@@ -70,11 +81,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("leaf-session-test-{}", std::process::id()));
         let path = dir.join("session.json");
         let session = Session {
-            tabs: vec![SessionTab { path: "/tmp/a.txt".into(), top_line: 42 }],
+            tabs: vec![SessionTab { path: "/tmp/a.txt".into(), top_line: 42, pinned: true }],
             active: Some(0),
             folders: vec!["/tmp/notes".into()],
             scope: Some(0),
             folder_file: Some("/tmp/notes/a.md".into()),
+            recent: vec!["/tmp/b.txt".into()],
+            solid: true,
+            zoom: 120,
         };
         save_to(&path, &session).unwrap();
         assert_eq!(load_from(&path), session);

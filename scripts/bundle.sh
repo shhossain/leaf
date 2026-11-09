@@ -17,6 +17,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/leaf"
 cp assets/Info.plist "$APP/Contents/Info.plist"
 cp assets/Leaf.icns "$APP/Contents/Resources/Leaf.icns"   # regenerate: scripts/make-icon.swift + iconutil
+cp scripts/leaf "$APP/Contents/Resources/leaf"   # the `leaf` command-line tool
 if [[ -n ${VERSION:-} ]]; then
   plutil -replace CFBundleShortVersionString -string "$VERSION" "$APP/Contents/Info.plist"
   plutil -replace CFBundleVersion -string "$VERSION" "$APP/Contents/Info.plist"

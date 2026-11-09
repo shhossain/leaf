@@ -28,7 +28,8 @@ use workspace::Workspace;
 
 actions!(
     leaf,
-    [Quit, OpenFile, Save, CloseTab, ReopenClosed, ToggleEdit, NextTab, PrevTab, ToggleSidebar, FocusSearch, NewNote, NewBoard, CompareWithPrevious, AddFolder]
+    [Quit, OpenFile, Save, CloseTab, ReopenClosed, ToggleEdit, NextTab, PrevTab, ToggleSidebar, FocusSearch, NewNote, NewBoard, CompareWithPrevious, AddFolder, TogglePin, DailyNote, RevealInFinder, CopyPath,
+        ToggleSolidBackground, CompareWithCommit]
 );
 
 /// ⌘1–⌘8 open the file at that position in the sidebar; ⌘9 opens the last
@@ -44,7 +45,7 @@ fn main() {
     // file:// URLs — possibly before the window exists, so queue them.
     let (open_tx, mut open_rx) = mpsc::unbounded::<Vec<PathBuf>>();
     app.on_open_urls(move |urls| {
-        let paths: Vec<PathBuf> = urls.iter().filter_map(|url| file_url_to_path(url)).collect();
+        let paths: Vec<PathBuf> = urls.iter().filter_map(|url| file_url_to_path(url).or_else(|| leaf_url_to_path(url))).collect();
         if !paths.is_empty() {
             let _ = open_tx.unbounded_send(paths);
         }
@@ -131,8 +132,14 @@ fn menus() -> Vec<Menu> {
             items: vec![
                 MenuItem::action("New Note", NewNote),
                 MenuItem::action("New Board", NewBoard),
+                MenuItem::action("Today's Note", DailyNote),
                 MenuItem::action("Open…", OpenFile),
                 MenuItem::action("Add Folder to Sidebar…", AddFolder),
+                MenuItem::action("Quick Open…", workspace::QuickOpen),
+                MenuItem::separator(),
+                MenuItem::action("Pin / Unpin File", TogglePin),
+                MenuItem::action("Reveal in Finder", RevealInFinder),
+                MenuItem::action("Copy Path", CopyPath),
                 MenuItem::action("Save", Save),
                 MenuItem::separator(),
                 MenuItem::action("Close Tab", CloseTab),
@@ -149,6 +156,10 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Search in Sidebar", FocusSearch),
                 MenuItem::separator(),
                 MenuItem::action("Compare with Previous File  (or ⌥-click a file)", CompareWithPrevious),
+                MenuItem::action("Compare with Last Commit", CompareWithCommit),
+                MenuItem::action("Go to Heading…", workspace::GoToHeading),
+                MenuItem::separator(),
+                MenuItem::action("Translucent / Solid Window", ToggleSolidBackground),
                 MenuItem::separator(),
                 MenuItem::action("Next Tab", NextTab),
                 MenuItem::action("Previous Tab", PrevTab),
@@ -177,10 +188,32 @@ fn cli_paths(args: impl Iterator<Item = OsString>) -> Vec<PathBuf> {
     paths
 }
 
+/// `leaf://open?path=%2Fa%2Fb.md&line=42` → `/a/b.md:42` (the `leaf` command).
+fn leaf_url_to_path(url: &str) -> Option<PathBuf> {
+    let query = url.strip_prefix("leaf://open?")?;
+    let (mut path, mut line) = (None, None);
+    for pair in query.split('&') {
+        match pair.split_once('=') {
+            Some(("path", value)) => path = Some(percent_decode(value)?),
+            Some(("line", value)) => line = value.parse::<usize>().ok(),
+            _ => {}
+        }
+    }
+    let mut path = path?;
+    if let Some(line) = line {
+        path.extend_from_slice(format!(":{line}").as_bytes());
+    }
+    Some(PathBuf::from(OsString::from_vec(path)))
+}
+
 /// `file:///Users/me/My%20Notes.txt` → `/Users/me/My Notes.txt`.
 fn file_url_to_path(url: &str) -> Option<PathBuf> {
     let rest = url.strip_prefix("file://")?;
     let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    Some(PathBuf::from(OsString::from_vec(percent_decode(rest)?)))
+}
+
+fn percent_decode(rest: &str) -> Option<Vec<u8>> {
     let bytes = rest.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -194,7 +227,7 @@ fn file_url_to_path(url: &str) -> Option<PathBuf> {
             i += 1;
         }
     }
-    Some(PathBuf::from(OsString::from_vec(out)))
+    Some(out)
 }
 
 #[cfg(test)]
@@ -206,5 +239,12 @@ mod tests {
     fn cli_skips_flags_and_macos_settings() {
         let args = ["-NSRequiresAquaSystemAppearance", "YES", "a.txt", "--verbose", "b.md"].map(Into::into);
         assert_eq!(cli_paths(args.into_iter()), [PathBuf::from("a.txt"), PathBuf::from("b.md")]);
+    }
+
+    #[test]
+    fn leaf_urls_carry_path_and_line() {
+        assert_eq!(super::leaf_url_to_path("leaf://open?path=%2Fa%20b%2Fc.md&line=42"), Some(PathBuf::from("/a b/c.md:42")));
+        assert_eq!(super::leaf_url_to_path("leaf://open?path=%2Fx.txt"), Some(PathBuf::from("/x.txt")));
+        assert_eq!(super::file_url_to_path("file:///a%20b.txt"), Some(PathBuf::from("/a b.txt")));
     }
 }

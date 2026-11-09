@@ -25,6 +25,15 @@ Leaf exists because CotEditor slows down with many files open, and TextEdit is n
 - **Recovery.** Unsaved edits are copied to `~/Library/Application Support/Leaf/Recovery` while you type. After a crash or a forced quit they come back the next time you open the file.
 - **External changes.** Files changed by other programs reload when you come back to them. If you have unsaved edits, Leaf warns you instead.
 - **Session.** Open files come back on the next launch, still unloaded until you click them.
+- **Quick Open (⌘P)** jumps to any open file, file in a watched folder, or recently closed file. **Go to Heading (⇧⌘J)** jumps within a Markdown file.
+- **Links.** ⌘-click a URL or a file reference such as `src/main.rs:42` in a log or in agent output to open it (in the browser, or in Leaf at that line). Links in rendered Markdown open the same way.
+- **The `leaf` command.** `leaf notes.md`, `leaf src/main.rs:42` or `leaf ~/Projects/site` (a folder goes to the sidebar), from a terminal or a coding agent. `./scripts/install.sh` installs it; with a downloaded app, run `ln -s /Applications/Leaf.app/Contents/Resources/leaf /usr/local/bin/leaf`.
+- **Logs.** In plain files, ERROR lines are red, WARN amber and DEBUG dimmed. Selecting a word marks it everywhere else on screen.
+- **Wrap and zoom.** ⌥Z wraps code and logs to the window (files up to 1 MB). ⌘+ and ⌘− change the text size; Leaf remembers it.
+- **Writing.** The toolbar shows the word count and reading time of notes and Markdown (or of the selection). Checklist boxes in a rendered page can be clicked to tick them, and double-clicking a paragraph starts editing there. ⌥⌘N opens today's note.
+- **Pinned files (⇧⌘P)** stay in a Pinned section at the top of the sidebar.
+- **Compare with Last Commit** (View menu) shows what changed in a file since the last git commit.
+- **Reveal in Finder (⌥⌘R)**, **Copy Path (⌥⌘C)**, and a solid (not translucent) window option in the View menu.
 
 | Code | Markdown | Editing a note |
 |---|---|---|
@@ -53,7 +62,8 @@ kanban-plugin: board
 - [x] Finished card
 ```
 
-- `#tag` shows as a label and `@{date}` as a due date.
+- `#tag` shows as a label and `@{date}` as a due date, in red once it has passed. Click a label to show only cards with it, or press ⌘F to filter by words, `#tag` or `overdue`.
+- Double-click a column's name to rename it, drag it by its name to reorder, or use **+ Add column**. Empty columns can be removed with their ✕.
 - Cards moved into a column marked `**Complete**` are ticked.
 - Anything after `***` (Obsidian's archive) and the `%% kanban:settings %%` block are kept but not shown.
 
@@ -114,9 +124,16 @@ The script prints the previous app for each type, so you can switch back the sam
 | Keys | Action |
 |---|---|
 | ⌘O | Open files |
+| ⌘P | Quick Open |
+| ⇧⌘J | Go to heading |
 | ⇧⌘O | Add a folder to the sidebar |
 | ⌘N, ⌘T | New note |
 | ⇧⌘N | New board |
+| ⌥⌘N | Today's note |
+| ⇧⌘P | Pin / unpin |
+| ⌥⌘R, ⌥⌘C | Reveal in Finder, copy path |
+| ⌥Z | Wrap long lines |
+| ⌘+, ⌘−, ⌘0 | Text size |
 | ⌘E, double-click | Edit / Done |
 | ⌘S | Save |
 | ⌘W | Close file |
@@ -145,6 +162,7 @@ On a board:
 | Space | Tick or untick |
 | ⌘⌫ | Delete the card |
 | ⌘Z | Undo |
+| ⌘F | Filter cards |
 | ⇧⌘V | Board / Markdown source |
 
 ## How it works
@@ -164,6 +182,9 @@ The viewer does not use a text editor widget. It keeps the file's bytes plus the
 | `src/file_list.rs` | Sidebar dates, preview lines, content search |
 | `src/folders.rs` | Listing watched folders |
 | `src/board.rs`, `src/board_ui.rs` | Kanban boards: parsing and edits, and the board view |
+| `src/page.rs` | Rendered pages: jumping, clickable checklists, word count |
+| `src/palette.rs` | Quick Open and Go to Heading |
+| `scripts/leaf` | The `leaf` command |
 | `src/recovery.rs` | Copies of unsaved edits |
 | `src/notes.rs` | Notes folder, auto-naming |
 | `src/style.rs` | Colors |

@@ -13,6 +13,14 @@
 	<key>NSHighResolutionCapable</key><true/>
 	<key>CFBundleIconFile</key><string>Leaf</string>
 	<key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+	<!-- leaf://open?path=/abs/file&line=42, used by the `leaf` command-line tool. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key><string>io.github.shhossain.leaf</string>
+			<key>CFBundleURLSchemes</key><array><string>leaf</string></array>
+		</dict>
+	</array>
 	<key>CFBundleDocumentTypes</key>
 	<array>
 		<!-- Text and source files: Leaf shows up in "Open With" and can be made the default. -->

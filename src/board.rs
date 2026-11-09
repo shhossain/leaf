@@ -281,6 +281,80 @@ pub fn delete_card(text: &str, lane: usize, card: usize) -> Option<String> {
     })
 }
 
+/// Where the columns end: the archive (`***`), the settings block, or the
+/// end of the file.
+fn lanes_end(lines: &[String], board: &Board) -> usize {
+    match board.lanes.last() {
+        Some(lane) => lane.end,
+        None => board_frontmatter(lines).map_or(lines.len(), |f| f + 1),
+    }
+}
+
+pub fn add_lane(text: &str, title: &str) -> Option<String> {
+    let title = title.trim().replace('\n', " ");
+    if title.is_empty() {
+        return None;
+    }
+    edit(text, |lines, board| {
+        let at = lanes_end(lines, board);
+        let mut block = Vec::new();
+        if at > 0 && !lines[at - 1].trim().is_empty() {
+            block.push(String::new());
+        }
+        block.extend([format!("## {title}"), String::new(), String::new()]);
+        lines.splice(at..at, block);
+        Some(())
+    })
+}
+
+pub fn rename_lane(text: &str, lane: usize, title: &str) -> Option<String> {
+    let title = title.trim().replace('\n', " ");
+    if title.is_empty() {
+        return None;
+    }
+    edit(text, |lines, board| {
+        lines[board.lanes.get(lane)?.heading] = format!("## {title}");
+        Some(())
+    })
+}
+
+/// Moves column `from` before column `before`, or to the end.
+pub fn move_lane(text: &str, from: usize, before: Option<usize>) -> Option<String> {
+    edit(text, |lines, board| {
+        let lane = board.lanes.get(from)?;
+        let at = match before.and_then(|b| board.lanes.get(b)) {
+            Some(next) => next.heading,
+            None => lanes_end(lines, board),
+        };
+        if at == lane.heading || at == lane.end {
+            return Some(());
+        }
+        let mut block: Vec<String> = lines[lane.heading..lane.end].to_vec();
+        if block.last().is_some_and(|l| !l.trim().is_empty()) {
+            block.push(String::new()); // the last column may end without a blank line
+        }
+        let len = lane.end - lane.heading;
+        lines.drain(lane.heading..lane.end);
+        let at = if at > lane.heading { at - len } else { at };
+        lines.splice(at..at, block);
+        Some(())
+    })
+}
+
+/// Removes an empty column.
+pub fn delete_lane(text: &str, lane: usize) -> Option<String> {
+    edit(text, |lines, board| {
+        let lane = board.lanes.get(lane).filter(|l| l.cards.is_empty())?;
+        lines.drain(lane.heading..lane.end);
+        Some(())
+    })
+}
+
+/// A due date (`2026-11-20`) before `today`.
+pub fn is_overdue(date: &str, today: &str) -> bool {
+    date.len() >= 10 && date.is_char_boundary(10) && date[..10].bytes().filter(|b| b.is_ascii_digit()).count() == 8 && &date[..10] < today
+}
+
 /// Splits a card into what the board shows.
 pub fn card_parts(card: &Card) -> CardParts {
     let mut parts = CardParts::default();
@@ -413,6 +487,24 @@ mod tests {
         let deleted = delete_card(SAMPLE, 0, 0).unwrap();
         assert_eq!(titles(&deleted)[0], ["Second"]);
         assert!(add_card(SAMPLE, 9, "x").is_none() && add_card(SAMPLE, 0, "  ").is_none());
+    }
+
+    #[test]
+    fn edits_columns() {
+        let lanes = |t: &str| parse(t).unwrap().lanes.iter().map(|l| l.title.clone()).collect::<Vec<_>>();
+        let added = add_lane(SAMPLE, "Review").unwrap();
+        assert_eq!(lanes(&added), ["Todo", "Doing", "Done", "Review"]);
+        assert!(added.contains("## Review\n\n\n***"), "before the archive");
+        let renamed = rename_lane(SAMPLE, 1, "In Progress").unwrap();
+        assert_eq!(lanes(&renamed), ["Todo", "In Progress", "Done"]);
+        let moved = move_lane(SAMPLE, 2, Some(0)).unwrap();
+        assert_eq!(lanes(&moved), ["Done", "Todo", "Doing"]);
+        assert_eq!(titles(&moved)[0], ["Old one"]);
+        let back = move_lane(&moved, 0, None).unwrap();
+        assert_eq!(lanes(&back), ["Todo", "Doing", "Done"]);
+        assert_eq!(lanes(&delete_lane(SAMPLE, 1).unwrap()), ["Todo", "Done"]);
+        assert!(delete_lane(SAMPLE, 0).is_none(), "only empty columns");
+        assert!(is_overdue("2026-11-01", "2026-11-10") && !is_overdue("2026-12-01", "2026-11-10") && !is_overdue("soon", "2026-11-10"));
     }
 
     #[test]

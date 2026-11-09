@@ -31,9 +31,14 @@ use crate::session::{self, Session, SessionTab};
 use crate::text_index::{Bytes, Document};
 use crate::viewer::{RichKind, Viewer};
 use crate::{
-    AddFolder, CloseTab, CompareWithPrevious, FocusSearch, NewBoard, NewNote, NextTab, OpenFile, PrevTab, Quit, ReopenClosed, Save, SelectTab, ToggleEdit,
+    AddFolder, CloseTab, CompareWithCommit, CompareWithPrevious, CopyPath, DailyNote, FocusSearch, NewBoard, NewNote,
+    RevealInFinder, ToggleSolidBackground, TogglePin, NextTab, OpenFile, PrevTab, Quit, ReopenClosed, Save, SelectTab, ToggleEdit,
     ToggleSidebar,
 };
+
+#[path = "palette.rs"]
+mod palette;
+pub use palette::{GoToHeading, QuickOpen};
 
 /// Tabs kept in memory at once. Everything else is just a path.
 const MAX_LIVE: usize = 12;
@@ -66,6 +71,54 @@ fn unified_diff(left: &std::path::Path, right: &std::path::Path) -> Result<Strin
         .to_string())
 }
 
+/// `src/main.rs:42` or `src/main.rs:42:7` → the file and line (1-based), when
+/// the path itself doesn't exist but the part before `:N` does.
+fn split_line_suffix(path: &Path) -> (PathBuf, Option<usize>) {
+    if path.exists() {
+        return (path.to_path_buf(), None);
+    }
+    let text = path.to_string_lossy();
+    let strip = |t: &str| -> Option<(String, usize)> {
+        let (head, tail) = t.rsplit_once(':')?;
+        tail.parse::<usize>().ok().map(|n| (head.to_string(), n))
+    };
+    if let Some((head, n)) = strip(&text) {
+        if Path::new(&head).exists() {
+            return (head.into(), Some(n));
+        }
+        if let Some((head, line)) = strip(&head).filter(|(h, _)| Path::new(h).exists()) {
+            return (head.into(), Some(line));
+        }
+    }
+    (path.to_path_buf(), None)
+}
+
+/// The file as of the last commit, written to a temporary file.
+fn committed_copy(path: &Path) -> Result<PathBuf, String> {
+    let dir = path.parent().ok_or("No folder")?;
+    let name = path.file_name().ok_or("No file name")?.to_string_lossy().into_owned();
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .arg("show")
+        .arg(format!("HEAD:./{name}"))
+        .output()
+        .map_err(|_| "Git is not installed.".to_string())?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(if err.contains("not a git repository") {
+            "This file is not in a git repository.".into()
+        } else {
+            "This file has no committed version (new or untracked).".into()
+        });
+    }
+    let tmp = std::env::temp_dir().join(format!("leaf-commit-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+    let copy = tmp.join(&name);
+    std::fs::write(&copy, output.stdout).map_err(|e| e.to_string())?;
+    Ok(copy)
+}
+
 /// Notes hide their extension, like titles in Notes; other files show it.
 fn display_title(path: &std::path::Path, note: bool) -> String {
     let name = if note { path.file_stem() } else { path.file_name() };
@@ -73,7 +126,12 @@ fn display_title(path: &std::path::Path, note: bool) -> String {
 }
 
 pub fn init(cx: &mut App) {
+    palette::init(cx);
     cx.bind_keys([
+        KeyBinding::new("cmd-shift-p", TogglePin, Some("Workspace")),
+        KeyBinding::new("alt-cmd-n", DailyNote, None),
+        KeyBinding::new("alt-cmd-r", RevealInFinder, Some("Workspace")),
+        KeyBinding::new("alt-cmd-c", CopyPath, Some("Workspace")),
         KeyBinding::new("cmd-o", OpenFile, None),
         KeyBinding::new("cmd-shift-o", AddFolder, None),
         KeyBinding::new("cmd-n", NewNote, None),
@@ -116,6 +174,8 @@ enum TabState {
         _changes: Subscription,
         /// Board edits are saved as they happen.
         _board_edits: Subscription,
+        /// ⌘-clicked paths and `file:line` references.
+        _links: Subscription,
     },
     Editing {
         editor: Entity<EditorState>,
@@ -158,6 +218,8 @@ struct DocTab {
     /// Opened by browsing a watched folder: listed there, not under Open
     /// Files, and not kept in the session.
     in_folder: bool,
+    /// Listed under Pinned at the top of the sidebar.
+    pinned: bool,
 }
 
 impl DocTab {
@@ -181,6 +243,7 @@ impl DocTab {
             recovery_task: None,
             pending_find: None,
             in_folder: false,
+            pinned: false,
         }
     }
 
@@ -280,6 +343,10 @@ impl RowGrouper {
 
     fn push(&mut self, modified: Option<SystemTime>, selected: bool, item: impl FnOnce(bool) -> SidebarItem) {
         let group = modified.map(|m| file_list::group_label(file_list::local(m), self.now)).unwrap_or_else(|| "Today".into());
+        self.push_in(group, selected, item);
+    }
+
+    fn push_in(&mut self, group: String, selected: bool, item: impl FnOnce(bool) -> SidebarItem) {
         if self.group.as_ref() != Some(&group) {
             self.items.push(SidebarItem::Header { label: group.clone().into(), first: self.group.is_none() });
             self.group = Some(group);
@@ -316,6 +383,11 @@ pub struct Workspace {
     /// Watched folders, and which one the sidebar shows (`None`: open files).
     folders: Vec<WatchedFolder>,
     scope: Option<usize>,
+    /// Quick Open / Go to Heading, while shown.
+    palette: Option<palette::Palette>,
+    /// Opaque window instead of the translucent sidebar (saved in the session).
+    solid: bool,
+    applied_solid: Option<bool>,
     /// Sidebar search inside files: path → first matching line, for `content_query`.
     content_hits: HashMap<PathBuf, String>,
     content_query: String,
@@ -408,6 +480,9 @@ impl Workspace {
             compare: None,
             folders: Vec::new(),
             scope: None,
+            palette: None,
+            solid: false,
+            applied_solid: Some(false), // the window is created translucent
             content_hits: Default::default(),
             content_query: String::new(),
             _content_search: None,
@@ -425,7 +500,9 @@ impl Workspace {
     /// Returns the id of that tab.
     pub fn open_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) -> Option<u64> {
         let mut first = None;
+        let mut jump = None;
         for path in paths {
+            let (path, line) = split_line_suffix(&path);
             let path = std::fs::canonicalize(&path).unwrap_or(path);
             if path.is_dir() {
                 self.watch_folder(path, cx);
@@ -438,7 +515,13 @@ impl Workspace {
                 }
                 None => self.push_tab(path),
             };
+            if first.is_none() {
+                jump = line.map(|line| (id, line.saturating_sub(1)));
+            }
             first.get_or_insert(id);
+        }
+        if let Some((id, line)) = jump {
+            self.go_to_line_in(id, line, cx);
         }
         if let Some(id) = first {
             // Loading and focusing happen in `render`, which has a window.
@@ -517,9 +600,31 @@ impl Workspace {
         }
         let (left_path, right_path) = (self.tabs[left].path.clone(), self.tabs[right].path.clone());
         let title: SharedString = format!("{}  ↔  {}", self.tabs[left].title, self.tabs[right].title).into();
+        self.compare_files(title, move || Ok((left_path, right_path)), cx);
+    }
+
+    /// Compares the open file with its last committed version (`git show HEAD:file`).
+    fn on_compare_commit(&mut self, _: &CompareWithCommit, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab() else { return };
+        let path = tab.path.clone();
+        let title: SharedString = format!("{}  ↔  last commit", tab.title).into();
+        self.compare_files(title, move || committed_copy(&path).map(|old| (old, path)), cx);
+    }
+
+    /// Shows the difference of two files; `files` runs in the background and
+    /// returns the (old, new) paths, or a message.
+    fn compare_files(
+        &mut self,
+        title: SharedString,
+        files: impl FnOnce() -> Result<(PathBuf, PathBuf), String> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
         self.compare = Some(Compare { title: title.clone(), state: None, message: Some("Comparing…".into()) });
         cx.spawn(async move |this, cx| {
-            let patch = cx.background_executor().spawn(async move { unified_diff(&left_path, &right_path) }).await;
+            let patch = cx
+                .background_executor()
+                .spawn(async move { files().and_then(|(left_path, right_path)| unified_diff(&left_path, &right_path)) })
+                .await;
             this.update(cx, |this, cx| {
                 let Some(compare) = this.compare.as_mut().filter(|c| c.title == title) else { return };
                 match patch.map(|patch| DiffFile::parse(&patch)) {
@@ -782,12 +887,18 @@ impl Workspace {
                 continue;
             }
             let id = self.push_tab(saved.path);
-            self.tabs.last_mut().expect("just pushed").top_line = saved.top_line;
+            let tab = self.tabs.last_mut().expect("just pushed");
+            (tab.top_line, tab.pinned) = (saved.top_line, saved.pinned);
             if session.active == Some(ix) {
                 active = Some(id);
             }
         }
         self.active = active.or(self.tabs.first().map(|t| t.id));
+        self.closed = session.recent.into_iter().map(|path| (path, 0)).collect();
+        self.solid = session.solid;
+        if session.zoom > 0 {
+            crate::viewer::set_font_scale_percent(session.zoom);
+        }
         for root in session.folders.into_iter().filter(|root| root.is_dir()) {
             self.add_folder(root);
         }
@@ -805,11 +916,20 @@ impl Workspace {
     fn session(&self, cx: &App) -> Session {
         let kept: Vec<&DocTab> = self.tabs.iter().filter(|t| !t.in_folder).collect();
         Session {
-            tabs: kept.iter().map(|t| SessionTab { path: t.path.clone(), top_line: t.current_line(cx) }).collect(),
+            tabs: kept
+                .iter()
+                .map(|t| SessionTab { path: t.path.clone(), top_line: t.current_line(cx), pinned: t.pinned })
+                .collect(),
             active: kept.iter().position(|t| Some(t.id) == self.active),
             folders: self.folders.iter().map(|f| f.root.clone()).collect(),
             scope: self.scope,
             folder_file: self.active_tab().filter(|t| t.in_folder).map(|t| t.path.clone()),
+            recent: {
+                let skip = self.closed.len().saturating_sub(MAX_CLOSED);
+                self.closed.iter().skip(skip).map(|(path, _)| path.clone()).collect()
+            },
+            solid: self.solid,
+            zoom: crate::viewer::font_scale_percent(),
         }
     }
 
@@ -949,7 +1069,14 @@ impl Workspace {
         let changes = cx.observe(&viewer, |_, _, cx| cx.notify());
         let id = self.tabs[ix].id;
         let board_edits = cx.subscribe(&viewer, move |this, _, _: &crate::viewer::BoardEdited, cx| this.save_board(id, cx));
-        TabState::Viewing { viewer, _changes: changes, _board_edits: board_edits }
+        let links = cx.subscribe(&viewer, |this, _, link: &crate::viewer::OpenLocation, cx| {
+            let target = match link.line {
+                Some(line) => PathBuf::from(format!("{}:{line}", link.path.display())),
+                None => link.path.clone(),
+            };
+            this.open_paths(vec![target], cx);
+        });
+        TabState::Viewing { viewer, _changes: changes, _board_edits: board_edits, _links: links }
     }
 
     /// Marks `id` most recently used and evicts tabs beyond `MAX_LIVE`.
@@ -1576,6 +1703,60 @@ impl Workspace {
         }
     }
 
+    fn on_toggle_pin(&mut self, _: &TogglePin, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.active_index() else { return };
+        let tab = &mut self.tabs[ix];
+        tab.pinned = !tab.pinned;
+        tab.in_folder &= !tab.pinned;
+        self.schedule_session_save(cx);
+        cx.notify();
+    }
+
+    fn on_daily_note(&mut self, _: &DailyNote, window: &mut Window, cx: &mut Context<Self>) {
+        match notes::daily_note() {
+            Ok(path) => {
+                self.search.update(cx, |state, cx| state.set_value("", window, cx));
+                self.open_paths(vec![path], cx);
+            }
+            Err(err) => {
+                let _ = window.prompt(PromptLevel::Critical, "Could not open today's note", Some(&err.to_string()), &["OK"], cx);
+            }
+        }
+    }
+
+    fn on_reveal(&mut self, _: &RevealInFinder, _: &mut Window, _: &mut Context<Self>) {
+        if let Some(tab) = self.active_tab() {
+            let _ = std::process::Command::new("open").arg("-R").arg(&tab.path).spawn();
+        }
+    }
+
+    fn on_copy_path(&mut self, _: &CopyPath, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_tab() {
+            cx.write_to_clipboard(ClipboardItem::new_string(tab.path.display().to_string()));
+        }
+    }
+
+    fn on_toggle_solid(&mut self, _: &ToggleSolidBackground, _: &mut Window, cx: &mut Context<Self>) {
+        self.solid = !self.solid;
+        self.schedule_session_save(cx);
+        cx.notify();
+    }
+
+    /// Scrolls tab `id` to `line` (0-based), now or once it loads.
+    fn go_to_line_in(&mut self, id: u64, line: usize, cx: &mut Context<Self>) {
+        let Some(ix) = self.index_of(id) else { return };
+        self.tabs[ix].top_line = line;
+        if let TabState::Viewing { viewer, .. } = &self.tabs[ix].state {
+            viewer.update(cx, |viewer, cx| viewer.go_to_line(line, cx));
+        }
+    }
+
+    fn go_to_line_in_active(&mut self, line: usize, cx: &mut Context<Self>) {
+        if let Some(id) = self.active {
+            self.go_to_line_in(id, line, cx);
+        }
+    }
+
     fn on_new_board(&mut self, _: &NewBoard, window: &mut Window, cx: &mut Context<Self>) {
         match notes::create_board() {
             Ok(path) => {
@@ -1646,12 +1827,20 @@ impl Workspace {
             }
             return rows.items;
         }
-        for ix in self.display_order() {
+        let order = self.display_order();
+        let pinned_first = order.iter().filter(|&&ix| self.tabs[ix].pinned).chain(order.iter().filter(|&&ix| !self.tabs[ix].pinned));
+        for &ix in pinned_first {
             let tab = &self.tabs[ix];
             if tab.in_folder || !matches(&tab.title, &tab.folder(), tab.meta.as_ref(), &tab.path) {
                 continue;
             }
-            rows.push(tab.modified(), Some(tab.id) == self.active, |separator| SidebarItem::File { ix, separator });
+            let selected = Some(tab.id) == self.active;
+            let item = |separator| SidebarItem::File { ix, separator };
+            if tab.pinned {
+                rows.push_in("Pinned".into(), selected, item);
+            } else {
+                rows.push(tab.modified(), selected, item);
+            }
         }
         rows.items
     }
@@ -1879,7 +2068,7 @@ impl Workspace {
             .flex_none()
             .h_full()
             // Translucent over the window's blur, like a macOS sidebar.
-            .bg(sidebar_bg.opacity(0.78))
+            .bg(sidebar_bg.opacity(if self.solid { 1.0 } else { 0.78 }))
             .border_r_1()
             .border_color(sidebar_border)
             .child(
@@ -2090,7 +2279,7 @@ impl Workspace {
             if let Some(summary) = viewer.read(cx).board_summary() {
                 details.push(summary);
             }
-            let status = viewer.read(cx).status();
+            let status = viewer.read(cx).status(cx);
             if !status.is_empty() {
                 details.push(status);
             }
@@ -2133,9 +2322,28 @@ impl Render for Workspace {
             self.title = title;
         }
 
+        if self.applied_solid != Some(self.solid) {
+            window.set_background_appearance(if self.solid {
+                WindowBackgroundAppearance::Opaque
+            } else {
+                WindowBackgroundAppearance::Blurred
+            });
+            self.applied_solid = Some(self.solid);
+        }
+        let palette = self.render_palette(cx);
+
         h_flex()
             .id("workspace")
             .key_context("Workspace")
+            .relative()
+            .on_action(cx.listener(Self::on_quick_open))
+            .on_action(cx.listener(Self::on_go_to_heading))
+            .on_action(cx.listener(Self::on_toggle_pin))
+            .on_action(cx.listener(Self::on_daily_note))
+            .on_action(cx.listener(Self::on_reveal))
+            .on_action(cx.listener(Self::on_copy_path))
+            .on_action(cx.listener(Self::on_toggle_solid))
+            .on_action(cx.listener(Self::on_compare_commit))
             .track_focus(&self.focus)
             .size_full()
             .text_color(cx.theme().foreground)
@@ -2167,5 +2375,6 @@ impl Render for Workspace {
                     .child(self.render_toolbar(cx))
                     .child(div().flex_1().min_h_0().child(self.render_body(cx))),
             )
+            .children(palette)
     }
 }

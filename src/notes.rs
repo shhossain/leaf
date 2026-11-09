@@ -25,6 +25,20 @@ pub fn create_new_note() -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Today's note, `2026-11-10.md`, created with a dated heading if it doesn't
+/// exist. The heading matches the file name, so naming from the first line
+/// keeps it.
+pub fn daily_note() -> std::io::Result<PathBuf> {
+    let dir = notes_dir().ok_or_else(|| std::io::Error::other("no Documents folder"))?;
+    std::fs::create_dir_all(&dir)?;
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let path = dir.join(format!("{today}.{EXTENSION}"));
+    if !path.exists() {
+        std::fs::write(&path, format!("# {today}\n\n"))?;
+    }
+    Ok(path)
+}
+
 /// Creates `Board.md` (or `Board 2.md`, …): an empty Kanban board with
 /// Todo, Doing and Done columns, in the Obsidian Kanban format.
 pub fn create_board() -> std::io::Result<PathBuf> {
