@@ -64,6 +64,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-{", PrevTab, Some("Workspace")),
         KeyBinding::new("cmd-alt-s", ToggleSidebar, Some("Workspace")),
         KeyBinding::new("cmd-alt-f", FocusSearch, Some("Workspace")),
+        KeyBinding::new("cmd-shift-f", FocusSearch, Some("Workspace")),
     ]);
 }
 
@@ -111,6 +112,8 @@ struct DocTab {
     autosave: Option<Task<()>>,
     /// Debounced copy of unsaved text to the recovery folder.
     recovery_task: Option<Task<()>>,
+    /// Find this text once the file has loaded (opened from a content search).
+    pending_find: Option<String>,
 }
 
 impl DocTab {
@@ -132,6 +135,7 @@ impl DocTab {
             start_editing: false,
             autosave: None,
             recovery_task: None,
+            pending_find: None,
         }
     }
 
@@ -193,6 +197,10 @@ pub struct Workspace {
     next_id: u64,
     focus: FocusHandle,
     sidebar_open: bool,
+    /// Sidebar search inside files: tab id → first matching line, for `content_query`.
+    content_hits: std::collections::HashMap<u64, String>,
+    content_query: String,
+    _content_search: Option<Task<()>>,
     /// Re-checks the visible file on disk (live reload, log tailing).
     _disk_poll: Option<Task<()>>,
     sidebar_list: ListState,
@@ -252,9 +260,10 @@ impl Workspace {
             async {}
         })
         .detach();
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
-        let search_events = cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search open files"));
+        let search_events = cx.subscribe(&search, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
+                this.search_contents(cx);
                 cx.notify();
             }
         });
@@ -266,6 +275,9 @@ impl Workspace {
             next_id: 1,
             focus,
             sidebar_open: true,
+            content_hits: Default::default(),
+            content_query: String::new(),
+            _content_search: None,
             _disk_poll: Some(disk_poll),
             sidebar_list: ListState::new(0, ListAlignment::Top, px(400.)),
             sidebar_items: Vec::new(),
@@ -356,6 +368,61 @@ impl Workspace {
         self.next_id += 1;
         self.tabs.push(DocTab::new(id, path));
         id
+    }
+
+    // ── searching inside open files ────────────────────────────────────────
+
+    /// Looks inside every open file for the sidebar query, in the background,
+    /// a moment after typing stops. Matches show their line as the preview.
+    fn search_contents(&mut self, cx: &mut Context<Self>) {
+        let query = self.search.read(cx).value().to_string();
+        if query.chars().count() < 2 {
+            self.content_hits.clear();
+            self.content_query.clear();
+            self._content_search = None;
+            return;
+        }
+        let Some(matcher) = crate::viewer::build_matcher(&query) else { return };
+        let targets: Vec<(u64, PathBuf)> = self.tabs.iter().map(|t| (t.id, t.path.clone())).collect();
+        self._content_search = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(200)).await;
+            let hits = cx
+                .background_executor()
+                .spawn(async move {
+                    targets
+                        .into_iter()
+                        .filter_map(|(id, path)| file_list::find_in_file(&path, &matcher).map(|line| (id, line)))
+                        .collect::<std::collections::HashMap<_, _>>()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                (this.content_hits, this.content_query) = (hits, query);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// The line inside `id` that matched the current sidebar search, if any.
+    fn content_hit(&self, id: u64, cx: &App) -> Option<&String> {
+        (self.content_query == self.search.read(cx).value().as_ref()).then(|| self.content_hits.get(&id)).flatten()
+    }
+
+    /// Opens a file from the sidebar; if it matched a content search, the
+    /// find bar opens on that text.
+    fn open_from_sidebar(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate(id, window, cx);
+        if self.content_hit(id, cx).is_none() {
+            return;
+        }
+        let query = self.content_query.clone();
+        let Some(ix) = self.index_of(id) else { return };
+        match &self.tabs[ix].state {
+            TabState::Viewing { viewer, .. } => {
+                viewer.clone().update(cx, |viewer, cx| viewer.find_text(&query, window, cx));
+            }
+            _ => self.tabs[ix].pending_find = Some(query),
+        }
     }
 
     // ── session ────────────────────────────────────────────────────────────
@@ -493,6 +560,9 @@ impl Workspace {
             }
             if std::mem::take(&mut self.tabs[ix].start_editing) {
                 self.toggle_edit(ix, window, cx);
+            }
+            if let (Some(query), TabState::Viewing { viewer, .. }) = (self.tabs[ix].pending_find.take(), &self.tabs[ix].state) {
+                viewer.clone().update(cx, |viewer, cx| viewer.find_text(&query, window, cx));
             }
         }
         let tab = &self.tabs[ix];
@@ -1112,7 +1182,7 @@ impl Workspace {
             if !query.is_empty() {
                 let snippet = tab.meta.as_ref().map(|m| m.snippet.as_str()).unwrap_or("");
                 let haystacks = [tab.title.as_ref(), tab.folder().as_str(), snippet].map(str::to_lowercase);
-                if !haystacks.iter().any(|s| s.contains(&query)) {
+                if !haystacks.iter().any(|s| s.contains(&query)) && self.content_hit(tab.id, cx).is_none() {
                     continue;
                 }
             }
@@ -1159,7 +1229,11 @@ impl Workspace {
         let row_group: SharedString = format!("row-{id}").into();
         let sub_color = if selected { selected_fg.opacity(0.75) } else { muted };
         let date = tab.modified().map(|m| file_list::row_date(file_list::local(m), chrono::Local::now())).unwrap_or_default();
-        let snippet = tab.meta.as_ref().map(|m| m.snippet.clone()).unwrap_or_default();
+        // During a content search, show the matching line instead of the first line.
+        let snippet = match self.content_hit(id, cx) {
+            Some(line) => line.clone(),
+            None => tab.meta.as_ref().map(|m| m.snippet.clone()).unwrap_or_default(),
+        };
         let title = if tab.dirty { format!("● {}", tab.title) } else { tab.title.to_string() };
         // `list` doesn't stretch its items; give each one the full width.
         v_flex()
@@ -1177,7 +1251,7 @@ impl Workspace {
                     .rounded(px(10.))
                     .when(selected, |row| row.bg(selected_bg).text_color(selected_fg))
                     .when(!selected, |row| row.hover(move |style| style.bg(hover_bg)))
-                    .on_click(cx.listener(move |this, _, window, cx| this.activate(id, window, cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| this.open_from_sidebar(id, window, cx)))
                     .child(div().pr_5().text_sm().font_weight(FontWeight::SEMIBOLD).truncate().child(title))
                     .child(
                         h_flex()

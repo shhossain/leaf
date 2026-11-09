@@ -48,6 +48,25 @@ pub fn peek(path: &Path) -> FileMeta {
     FileMeta { modified, snippet: first_line(&text) }
 }
 
+/// Searches inside a file for the sidebar's content search: returns the
+/// first matching line (trimmed), or `None`. Files over 16 MB and binary
+/// files are skipped; only their names are searched.
+pub fn find_in_file(path: &Path, matcher: &regex::bytes::Regex) -> Option<String> {
+    const MAX_SEARCH_BYTES: u64 = 16 * 1024 * 1024;
+    if std::fs::metadata(path).ok()?.len() > MAX_SEARCH_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if !encoding::has_bom(&bytes) && bytes[..bytes.len().min(8192)].contains(&0) {
+        return None;
+    }
+    let text = encoding::decode(bytes).utf8;
+    let m = matcher.find(&text)?;
+    let line_start = text[..m.start()].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+    let line_end = text[m.start()..].iter().position(|&b| b == b'\n').map_or(text.len(), |p| m.start() + p);
+    Some(first_line(&String::from_utf8_lossy(&text[line_start..line_end])))
+}
+
 fn first_line(text: &str) -> String {
     let line = text
         .lines()

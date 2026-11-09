@@ -27,13 +27,15 @@ actions!(
     viewer,
     [
         LineUp, LineDown, PageUp, PageDown, Top, Bottom, CopySelection, SelectAllText, Find,
-        FindNext, FindPrev, GoToLine, Dismiss, TogglePreview
+        FindNext, FindPrev, GoToLine, Dismiss, TogglePreview, FilterLines
     ]
 );
 
 /// Highlighted chunks kept around for scrolling back and forth.
 const CHUNK_CACHE: usize = 8;
 const MAX_MATCHES: usize = 100_000;
+/// Lines a filter shows at most.
+const MAX_FILTER_LINES: usize = 1_000_000;
 /// Frames to wait for the line list's first layout before dropping a scroll.
 const MAX_SCROLL_RETRIES: u8 = 5;
 /// Markdown bigger than this opens as source; rendering it all would be slow.
@@ -146,6 +148,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-g", FindNext, root),
         KeyBinding::new("cmd-shift-g", FindPrev, root),
         KeyBinding::new("cmd-l", GoToLine, root),
+        KeyBinding::new("cmd-shift-l", FilterLines, root),
         KeyBinding::new("cmd-shift-v", TogglePreview, root),
         KeyBinding::new("escape", Dismiss, Some("ViewerBar")),
     ]);
@@ -164,6 +167,18 @@ struct FindBar {
     matches: Arc<Vec<Range<usize>>>,
     current: Option<usize>,
     searching: Option<Task<()>>,
+    _events: Subscription,
+}
+
+/// "Show only lines matching…": the list shows `lines` instead of every line.
+struct FilterBar {
+    input: Entity<InputState>,
+    /// Matching line numbers; `None` while the query is empty (show all).
+    lines: Option<Arc<Vec<usize>>>,
+    truncated: bool,
+    /// Keep the view at the bottom when new results arrive (log tailing).
+    stick_to_bottom: bool,
+    running: Option<Task<()>>,
     _events: Subscription,
 }
 
@@ -191,6 +206,7 @@ pub struct Viewer {
     dragging: bool,
     find: Option<FindBar>,
     goto: Option<GotoBar>,
+    filter: Option<FilterBar>,
     flash_line: Option<usize>,
     /// `(line, center)` to scroll to on the next render.
     pending_scroll: Option<(usize, bool)>,
@@ -230,6 +246,7 @@ impl Viewer {
             dragging: false,
             find: None,
             goto: None,
+            filter: None,
             flash_line: None,
             pending_scroll: None,
             pending_scroll_retries: 0,
@@ -351,7 +368,10 @@ impl Viewer {
         if self.preview.is_some() {
             self.preview = self.build_preview();
         }
-        if at_bottom {
+        if let Some(filter) = self.filter.as_mut() {
+            filter.stick_to_bottom = at_bottom;
+            self.run_filter(cx);
+        } else if at_bottom {
             // Deferred by the list until it has laid out the new rows.
             self.scroll.scroll_to_item(self.doc.line_count() - 1, ScrollStrategy::Bottom);
         }
@@ -361,9 +381,34 @@ impl Viewer {
         cx.notify();
     }
 
+    /// Rows the list shows: every line, or only those a filter matched.
+    fn filtered(&self) -> Option<&Arc<Vec<usize>>> {
+        self.filter.as_ref().and_then(|f| f.lines.as_ref())
+    }
+
+    fn row_count(&self) -> usize {
+        self.filtered().map_or(self.doc.line_count(), |lines| lines.len().max(1))
+    }
+
+    fn line_of_row(&self, row: usize) -> usize {
+        match self.filtered() {
+            Some(lines) => lines.get(row).or(lines.last()).copied().unwrap_or(0),
+            None => row,
+        }
+    }
+
+    /// The row showing `line`, or the nearest one after it when filtered.
+    fn row_of_line(&self, line: usize) -> usize {
+        match self.filtered() {
+            Some(lines) => lines.partition_point(|&l| l < line).min(lines.len().saturating_sub(1)),
+            None => line,
+        }
+    }
+
     pub fn top_line(&self) -> usize {
         let offset = self.scroll.0.borrow().base_handle.offset();
-        ((-offset.y / self.row_height).max(0.) as usize).min(self.doc.line_count() - 1)
+        let row = ((-offset.y / self.row_height).max(0.) as usize).min(self.row_count() - 1);
+        self.line_of_row(row)
     }
 
     pub fn scroll_to_line(&mut self, line: usize, cx: &mut Context<Self>) {
@@ -393,9 +438,10 @@ impl Viewer {
             return;
         }
         self.pending_scroll_retries = 0;
-        let content = self.row_height * self.doc.line_count() as f32;
+        let content = self.row_height * self.row_count() as f32;
+        let line = self.row_of_line(line);
         let max = (content - viewport).max(px(0.));
-        let mut y = self.row_height * line.min(self.doc.line_count() - 1) as f32;
+        let mut y = self.row_height * line.min(self.row_count() - 1) as f32;
         if center {
             y -= (viewport - self.row_height) / 2.;
         }
@@ -416,6 +462,9 @@ impl Viewer {
         }
         if !self.pending_chunks.is_empty() {
             parts.push("highlighting…".into());
+        }
+        if let Some(lines) = self.filtered() {
+            parts.push(format!("filtered: {} lines", lines.len()));
         }
         parts.join("  ·  ")
     }
@@ -466,11 +515,18 @@ impl Viewer {
 
         let selection = self.selection();
         let find = self.find.as_ref().map(|f| (f.matches.clone(), f.current));
-        let line_ranges = self.doc.line_ranges(range.clone());
-        let mut rows = Vec::with_capacity(line_ranges.len());
+        let lines: Vec<(usize, Range<usize>)> = match self.filtered() {
+            Some(filtered) => filtered
+                .get(range.start.min(filtered.len())..range.end.min(filtered.len()))
+                .unwrap_or_default()
+                .iter()
+                .map(|&line| (line, self.doc.line_range(line)))
+                .collect(),
+            None => range.clone().zip(self.doc.line_ranges(range.clone())).collect(),
+        };
+        let mut rows = Vec::with_capacity(lines.len());
 
-        for (i, source) in line_ranges.into_iter().enumerate() {
-            let line = range.start + i;
+        for (line, source) in lines {
             let display = DisplayLine::new(&self.doc.slice(source.clone()));
             let to_display = |r: Range<usize>| display.source_to_display(r.start)..display.source_to_display(r.end);
 
@@ -547,8 +603,8 @@ impl Viewer {
             (state.base_handle.bounds(), state.base_handle.offset())
         };
         let y = point.y - bounds.top() - offset.y;
-        let last = self.doc.line_count() - 1;
-        let line = ((y / self.row_height).floor().max(0.) as usize).min(last);
+        let row = ((y / self.row_height).floor().max(0.) as usize).min(self.row_count() - 1);
+        let line = self.line_of_row(row);
         let x = point.x - bounds.left() - offset.x - self.gutter_width;
         let raw = self.doc.slice(self.doc.line_range(line));
         let display = DisplayLine::new(&raw);
@@ -654,10 +710,22 @@ impl Viewer {
     // ── clipboard ──────────────────────────────────────────────────────────
 
     fn on_copy(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some((start, end)) = self.selection() {
-            let text = self.doc.text(self.offset_of(start)..self.offset_of(end)).into_owned();
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
-        }
+        let Some((start, end)) = self.selection() else { return };
+        let text = match self.filtered().filter(|_| start.line != end.line) {
+            // Filtered: copy what's shown, not the hidden lines in between.
+            Some(lines) => lines[lines.partition_point(|&l| l < start.line)..lines.partition_point(|&l| l <= end.line)]
+                .iter()
+                .map(|&line| {
+                    let range = self.doc.line_range(line);
+                    let from = if line == start.line { range.start + start.col } else { range.start };
+                    let to = if line == end.line { (range.start + end.col).min(range.end) } else { range.end };
+                    self.doc.text(from.min(to)..to).into_owned()
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            None => self.doc.text(self.offset_of(start)..self.offset_of(end)).into_owned(),
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
     fn on_select_all(&mut self, _: &SelectAllText, _: &mut Window, cx: &mut Context<Self>) {
@@ -670,6 +738,7 @@ impl Viewer {
 
     fn on_find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
         self.preview = None; // find works on lines: show the source
+        self.filter = None;
         if self.find.is_none() {
             let input = cx.new(|cx| InputState::new(window, cx).placeholder("Find"));
             let events = cx.subscribe(&input, |this, _, event: &InputEvent, cx| match event {
@@ -694,6 +763,17 @@ impl Viewer {
         }
         input.update(cx, |state, cx| state.focus(window, cx));
         cx.notify();
+    }
+
+    /// Opens the find bar with `query` and jumps to the first match (used when
+    /// a file is opened from a content search in the sidebar).
+    pub fn find_text(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_find(&Find, window, cx);
+        if let Some(find) = &self.find {
+            let input = find.input.clone();
+            input.update(cx, |state, cx| state.set_value(query.to_string(), window, cx));
+        }
+        self.run_search(cx);
     }
 
     fn run_search(&mut self, cx: &mut Context<Self>) {
@@ -749,10 +829,67 @@ impl Viewer {
         self.step_match(-1, cx);
     }
 
+    // ── filter ─────────────────────────────────────────────────────────────
+
+    fn on_filter(&mut self, _: &FilterLines, window: &mut Window, cx: &mut Context<Self>) {
+        self.preview = None;
+        (self.find, self.goto) = (None, None);
+        if self.filter.is_none() {
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder("Show lines containing…  (/regex/)"));
+            let events = cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.run_filter(cx);
+                }
+            });
+            self.filter = Some(FilterBar {
+                input,
+                lines: None,
+                truncated: false,
+                stick_to_bottom: false,
+                running: None,
+                _events: events,
+            });
+        }
+        let input = self.filter.as_ref().expect("just opened").input.clone();
+        input.update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    fn run_filter(&mut self, cx: &mut Context<Self>) {
+        let keep_line = self.top_line();
+        let doc = self.doc.clone();
+        let Some(filter) = self.filter.as_mut() else { return };
+        let query = filter.input.read(cx).value().to_string();
+        filter.running = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(120)).await;
+            let result = if query.is_empty() {
+                None
+            } else {
+                Some(cx.background_executor().spawn(async move { matching_lines(&doc, &query) }).await)
+            };
+            this.update(cx, |viewer, cx| {
+                let Some(filter) = viewer.filter.as_mut() else { return };
+                let stick = std::mem::take(&mut filter.stick_to_bottom);
+                (filter.lines, filter.truncated) = match result {
+                    Some((lines, truncated)) => (Some(Arc::new(lines)), truncated),
+                    None => (None, false),
+                };
+                if stick {
+                    viewer.scroll.scroll_to_item(viewer.row_count() - 1, ScrollStrategy::Bottom);
+                } else {
+                    viewer.pending_scroll = Some((keep_line, false));
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     // ── go to line ─────────────────────────────────────────────────────────
 
     fn on_goto(&mut self, _: &GoToLine, window: &mut Window, cx: &mut Context<Self>) {
         self.preview = None;
+        self.filter = None;
         let input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(format!("Go to line (1–{})", self.doc.line_count()))
         });
@@ -776,7 +913,7 @@ impl Viewer {
     }
 
     fn on_dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
-        if self.goto.take().is_some() || self.find.take().is_some() {
+        if self.goto.take().is_some() || self.find.take().is_some() || self.filter.take().is_some() {
             window.focus(&self.focus, cx);
         } else {
             self.anchor = None;
@@ -824,12 +961,12 @@ impl Render for Viewer {
 
         let list = uniform_list(
             "rows",
-            self.doc.line_count(),
+            self.row_count(),
             cx.processor(|this, range: Range<usize>, window, cx| this.render_rows(range, window, cx)),
         )
         .track_scroll(&self.scroll)
         .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
-        .with_width_from_item(Some(self.doc.longest_line()))
+        .with_width_from_item(self.filtered().is_none().then(|| self.doc.longest_line()))
         .size_full();
 
         v_flex()
@@ -841,8 +978,26 @@ impl Render for Viewer {
             .on_action(cx.listener(Self::on_goto))
             .on_action(cx.listener(Self::on_dismiss))
             .on_action(cx.listener(Self::on_toggle_preview))
+            .on_action(cx.listener(Self::on_filter))
             .when_some(self.goto.as_ref(), |this, goto| {
                 this.child(self.render_bar(Input::new(&goto.input).small(), cx))
+            })
+            .when_some(self.filter.as_ref(), |this, filter| {
+                let label = match &filter.lines {
+                    None => String::new(),
+                    Some(lines) if lines.is_empty() => "No matching lines".into(),
+                    Some(lines) => format!(
+                        "{}{} of {} lines",
+                        lines.len(),
+                        if filter.truncated { "+" } else { "" },
+                        self.doc.line_count()
+                    ),
+                };
+                this.child(
+                    self.render_bar(Input::new(&filter.input).small(), cx)
+                        .child(div().text_color(muted).child(label))
+                        .child(div().text_xs().text_color(muted).child("esc shows all lines")),
+                )
             })
             .when_some(self.find.as_ref(), |this, find| {
                 let label = match (find.current, find.matches.len()) {
@@ -882,45 +1037,84 @@ impl Render for Viewer {
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
                     .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.dragging = false))
-                    .child(list)
+                    .when(self.filtered().is_none_or(|l| !l.is_empty()), |this| this.child(list))
                     .child(Scrollbar::new(&self.scroll)),
             ))
     }
 }
 
-/// Searches the whole document; smart case (any uppercase → case-sensitive).
-fn search(doc: &Document, query: &str) -> Vec<Range<usize>> {
+/// Builds the matcher for a find/filter query: literal text with smart case
+/// (any uppercase letter → case-sensitive), or a regular expression when the
+/// query is written as `/pattern/`.
+pub fn build_matcher(query: &str) -> Option<regex::bytes::Regex> {
     if query.is_empty() {
-        return Vec::new();
+        return None;
     }
     let case_sensitive = query.chars().any(char::is_uppercase);
-    let Ok(regex) = regex::bytes::RegexBuilder::new(&regex::escape(query))
-        .case_insensitive(!case_sensitive)
-        .build()
-    else {
-        return Vec::new();
+    let pattern = match query.strip_prefix('/').and_then(|q| q.strip_suffix('/')) {
+        Some(pattern) if !pattern.is_empty() => pattern.to_string(),
+        _ => regex::escape(query),
     };
+    // Multi-line: `^` and `$` match at each line, which is what a line filter means.
+    regex::bytes::RegexBuilder::new(&pattern).case_insensitive(!case_sensitive).multi_line(true).build().ok()
+}
+
+/// Calls `f` with each match in order until it returns false. Documents on
+/// disk are searched in 1 MB chunks that overlap enough for a match to
+/// straddle a boundary; each match belongs to the chunk it starts in.
+fn for_each_match(doc: &Document, regex: &regex::bytes::Regex, mut f: impl FnMut(Range<usize>) -> bool) {
     if let Some(all) = doc.as_slice() {
-        return regex.find_iter(all).take(MAX_MATCHES).map(|m| m.range()).collect();
+        for m in regex.find_iter(all) {
+            if !f(m.range()) {
+                return;
+            }
+        }
+        return;
     }
-    // On disk: search in 1 MB chunks that overlap by enough bytes for a match
-    // to straddle a boundary; each match belongs to the chunk it starts in.
-    let overlap = query.len() * 4 + 16;
-    let mut found: Vec<Range<usize>> = Vec::new();
+    let overlap = 4096;
     let mut pos = 0;
-    while pos < doc.len() && found.len() < MAX_MATCHES {
+    while pos < doc.len() {
         let end = (pos + crate::text_index::SCAN_CHUNK).min(doc.len());
         let chunk = doc.slice(pos..end + overlap);
         for m in regex.find_iter(&chunk) {
             let start = pos + m.start();
-            if start >= end || found.len() >= MAX_MATCHES {
+            if start >= end {
                 break;
             }
-            found.push(start..pos + m.end());
+            if !f(start..pos + m.end()) {
+                return;
+            }
         }
         pos = end;
     }
+}
+
+/// Every match of `query` in the document (capped).
+fn search(doc: &Document, query: &str) -> Vec<Range<usize>> {
+    let Some(regex) = build_matcher(query) else { return Vec::new() };
+    let mut found = Vec::new();
+    for_each_match(doc, &regex, |m| {
+        found.push(m);
+        found.len() < MAX_MATCHES
+    });
     found
+}
+
+/// Lines containing a match of `query`, in order, and whether the list was cut off.
+fn matching_lines(doc: &Document, query: &str) -> (Vec<usize>, bool) {
+    let Some(regex) = build_matcher(query) else { return (Vec::new(), false) };
+    let (mut lines, mut line_end, mut truncated) = (Vec::new(), None::<usize>, false);
+    for_each_match(doc, &regex, |m| {
+        if line_end.is_some_and(|end| m.start <= end) {
+            return true; // another match on a line we already have
+        }
+        let line = doc.line_of_offset(m.start);
+        lines.push(line);
+        line_end = Some(doc.line_range(line).end);
+        truncated = lines.len() >= MAX_FILTER_LINES;
+        !truncated
+    });
+    (lines, truncated)
 }
 
 /// Flattens color spans and background spans into the sorted, non-overlapping
@@ -988,6 +1182,16 @@ mod tests {
     fn notes_get_a_title_and_line_breaks() {
         let out = super::note_markdown("Weekend plans\nHike\nLunch\n\n```\na\nb\n```");
         assert_eq!(out, "# Weekend plans\n\nHike  \nLunch\n\n```\na\nb\n```\n");
+    }
+
+    #[test]
+    fn filters_lines_by_text_and_regex() {
+        use crate::text_index::Bytes;
+        let doc = Document::new(Bytes::Owned(b"INFO a\nERROR b\nINFO c error\nWARN d\n".to_vec()), true);
+        assert_eq!(super::matching_lines(&doc, "error"), (vec![1, 2], false));
+        assert_eq!(super::matching_lines(&doc, "ERROR"), (vec![1], false));
+        assert_eq!(super::matching_lines(&doc, "/^(WARN|ERROR)/"), (vec![1, 3], false));
+        assert_eq!(super::matching_lines(&doc, ""), (vec![], false));
     }
 
     #[test]

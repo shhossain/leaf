@@ -140,7 +140,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Toggle Edit Mode", ToggleEdit),
                 MenuItem::action("Page / Source Lines", viewer::TogglePreview),
                 MenuItem::action("Show/Hide Sidebar", ToggleSidebar),
-                MenuItem::action("Search Files", FocusSearch),
+                MenuItem::action("Search in Open Files", FocusSearch),
                 MenuItem::separator(),
                 MenuItem::action("Next Tab", NextTab),
                 MenuItem::action("Previous Tab", PrevTab),
