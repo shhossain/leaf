@@ -17,7 +17,6 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Editor, EditorState, Input, InputEvent, InputState, Position, TabSize},
-    theme::Theme,
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -26,11 +25,12 @@ use gpui_kit::*;
 use crate::doc::{self, DiskStamp, Loaded};
 use crate::encoding::{self, TextFormat};
 use crate::file_list::{self, FileMeta};
+use crate::{notes, style};
 use crate::session::{self, Session, SessionTab};
 use crate::text_index::{Bytes, Document};
 use crate::viewer::Viewer;
 use crate::{
-    CloseTab, FocusSearch, NextTab, OpenFile, PrevTab, Quit, ReopenClosed, Save, ToggleEdit, ToggleSidebar,
+    CloseTab, FocusSearch, NewNote, NextTab, OpenFile, PrevTab, Quit, ReopenClosed, Save, ToggleEdit, ToggleSidebar,
 };
 
 /// Tabs kept in memory at once. Everything else is just a path.
@@ -42,9 +42,16 @@ const TOOLBAR_HEIGHT: f32 = 52.;
 /// Room for the traffic lights, which sit inside the toolbar like in Notes.
 const TRAFFIC_LIGHTS_WIDTH: f32 = 78.;
 
+/// Notes hide their extension, like titles in Notes; other files show it.
+fn display_title(path: &std::path::Path, note: bool) -> String {
+    let name = if note { path.file_stem() } else { path.file_name() };
+    name.map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
+}
+
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-o", OpenFile, None),
+        KeyBinding::new("cmd-n", NewNote, None),
         KeyBinding::new("cmd-e", ToggleEdit, Some("Workspace")),
         KeyBinding::new("cmd-s", Save, Some("Workspace")),
         KeyBinding::new("cmd-w", CloseTab, Some("Workspace")),
@@ -68,6 +75,8 @@ enum TabState {
     },
     Editing {
         editor: Entity<EditorState>,
+        /// Markdown / text: edited like Notes (system font, wrapped, no line numbers).
+        prose: bool,
         /// The document the editor was opened from (for the status bar).
         doc: Arc<Document>,
         _changes: Subscription,
@@ -93,18 +102,20 @@ struct DocTab {
     /// Date and first line for the sidebar; read from the first 2KB only.
     meta: Option<FileMeta>,
     peeking: bool,
+    /// In the Leaf Notes folder: saved automatically and named from its first line.
+    note: bool,
+    /// Open in the editor as soon as it loads (a freshly created note).
+    start_editing: bool,
+    autosave: Option<Task<()>>,
 }
 
 impl DocTab {
     fn new(id: u64, path: PathBuf) -> Self {
-        let title = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
+        let note = notes::is_note(&path);
         Self {
             id,
+            title: display_title(&path, note).into(),
             path,
-            title: title.into(),
             state: TabState::Cold,
             dirty: false,
             top_line: 0,
@@ -113,6 +124,9 @@ impl DocTab {
             conflict: None,
             meta: None,
             peeking: false,
+            note,
+            start_editing: false,
+            autosave: None,
         }
     }
 
@@ -170,10 +184,8 @@ impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
-        Theme::sync_system_appearance(Some(window), cx);
-        cx.observe_window_appearance(window, |_, window, cx| {
-            Theme::sync_system_appearance(Some(window), cx);
-        })
+        style::apply(Some(window), cx);
+        cx.observe_window_appearance(window, |_, window, cx| style::apply(Some(window), cx))
         .detach();
         // Coming back to the app is when files have usually changed underneath us.
         cx.observe_window_activation(window, |this, window, cx| {
@@ -420,6 +432,9 @@ impl Workspace {
             if self.active == Some(id) {
                 self.focus_tab(ix, window, cx);
             }
+            if std::mem::take(&mut self.tabs[ix].start_editing) {
+                self.toggle_edit(ix, window, cx);
+            }
         }
         let tab = &self.tabs[ix];
         if let Some(doc) = tab.doc(cx) {
@@ -523,6 +538,11 @@ impl Workspace {
     /// Switches the tab between the viewer and the full editor.
     fn toggle_edit(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.tabs[ix].id;
+        // Leaving a note's editor saves it, as Notes would.
+        if self.tabs[ix].note && self.tabs[ix].dirty && matches!(self.tabs[ix].state, TabState::Editing { .. }) {
+            let _ = self.write_tab(id, cx);
+        }
+        let Some(ix) = self.index_of(id) else { return };
         match &self.tabs[ix].state {
             TabState::Viewing { viewer, .. } => {
                 let (doc, top, at) =
@@ -553,12 +573,20 @@ impl Workspace {
                 let text = doc.text(0..doc.len()).into_owned();
                 let language = doc::language_token(&self.tabs[ix].path);
                 let tab_size = TabSize { tab_size: crate::text_index::TAB_WIDTH, hard_tabs: doc::indents_with_tabs(&doc) };
+                let prose = crate::viewer::is_page_file(&self.tabs[ix].path);
                 let editor = cx.new(|cx| {
-                    EditorState::new(window, cx).language(language).tab_size(tab_size).default_value(text)
+                    let state = EditorState::new(window, cx).language(language).tab_size(tab_size);
+                    let state = if prose {
+                        state.line_number(false).soft_wrap(true).folding(false).indent_guides(false)
+                    } else {
+                        state
+                    };
+                    state.default_value(text)
                 });
                 let changes = cx.subscribe(&editor, move |this, _, event: &InputEvent, cx| {
                     if matches!(event, InputEvent::Change) {
                         this.set_dirty(id, true, cx);
+                        this.schedule_autosave(id, cx);
                     }
                 });
                 // Keep the reader's place: the text reaches the editor on its first paint.
@@ -569,7 +597,7 @@ impl Workspace {
                         state.focus(window, cx);
                     });
                 });
-                self.tabs[ix].state = TabState::Editing { editor, doc, _changes: changes };
+                self.tabs[ix].state = TabState::Editing { editor, prose, doc, _changes: changes };
             }
             TabState::Editing { editor, .. } => {
                 let top = editor.read(cx).cursor_position().line as usize;
@@ -615,35 +643,80 @@ impl Workspace {
             .detach();
             return false;
         }
+        if let Err(detail) = self.write_tab(id, cx) {
+            let title = format!("Could not save {}", self.tabs[ix].title);
+            let _ = window.prompt(PromptLevel::Critical, &title, Some(&detail), &["OK"], cx);
+            return false;
+        }
+        true
+    }
+
+    /// Writes the tab in its original encoding, BOM and line endings, without
+    /// asking anything. Notes are also renamed after their first line.
+    fn write_tab(&mut self, id: u64, cx: &mut Context<Self>) -> Result<(), String> {
+        let ix = self.index_of(id).ok_or("The file was closed.")?;
+        let tab = &self.tabs[ix];
+        if !tab.dirty {
+            return Ok(());
+        }
         let text: String = match &tab.state {
             TabState::Editing { editor, .. } => editor.read(cx).text().to_string(),
             TabState::Viewing { viewer, .. } => viewer.read(cx).doc().text(0..viewer.read(cx).doc().len()).into_owned(),
-            _ => return false,
+            _ => return Err("Nothing to save.".into()),
         };
         let (bytes, unmappable) = encoding::encode(&text, tab.format);
-        let failure = if unmappable {
-            Some(format!(
+        if unmappable {
+            return Err(format!(
                 "Some characters can't be represented in {}. Remove them, or save a copy as UTF-8.",
                 tab.format.encoding.name()
-            ))
-        } else {
-            std::fs::write(&tab.path, bytes).err().map(|err| err.to_string())
-        };
-        if let Some(detail) = failure {
-            let title = format!("Could not save {}", tab.title);
-            let _ = window.prompt(PromptLevel::Critical, &title, Some(&detail), &["OK"], cx);
-            return false;
+            ));
+        }
+        std::fs::write(&tab.path, bytes).map_err(|err| err.to_string())?;
+        if tab.note {
+            self.rename_note(ix, &text);
         }
         let tab = &mut self.tabs[ix];
         (tab.stamp, tab.conflict) = (doc::stamp(&tab.path), None);
         self.set_dirty(id, false, cx);
         self.refresh_meta(id, cx);
-        true
+        self.schedule_session_save(cx);
+        Ok(())
+    }
+
+    /// Keeps a note's file name in step with its first line.
+    fn rename_note(&mut self, ix: usize, text: &str) {
+        let tab = &mut self.tabs[ix];
+        let Some(target) = notes::renamed_path(&tab.path, &notes::name_from_text(text)) else { return };
+        if std::fs::rename(&tab.path, &target).is_ok() {
+            tab.title = display_title(&target, true).into();
+            tab.path = target;
+        }
+    }
+
+    /// Notes save themselves shortly after the last keystroke.
+    fn schedule_autosave(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(ix) = self.index_of(id) else { return };
+        if !self.tabs[ix].note {
+            return;
+        }
+        self.tabs[ix].autosave = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(700)).await;
+            this.update(cx, |this, cx| {
+                if let Err(err) = this.write_tab(id, cx) {
+                    eprintln!("[leaf] auto-save failed: {err}");
+                }
+            })
+            .ok();
+        }));
     }
 
     // ── closing & quitting ─────────────────────────────────────────────────
 
     fn close_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.index_of(id) else { return };
+        if self.tabs[ix].note && self.tabs[ix].dirty {
+            let _ = self.write_tab(id, cx); // notes never ask
+        }
         let Some(ix) = self.index_of(id) else { return };
         if !self.tabs[ix].dirty {
             self.remove_tab(id, window, cx);
@@ -676,7 +749,12 @@ impl Workspace {
         let next = order.get(pos + 1).or(pos.checked_sub(1).and_then(|p| order.get(p))).map(|&o| self.tabs[o].id);
         let line = self.tabs[ix].current_line(cx);
         let tab = self.tabs.remove(ix);
-        self.closed.push((tab.path, line));
+        let empty_note = tab.note && !tab.dirty && std::fs::metadata(&tab.path).is_ok_and(|m| m.len() == 0);
+        if empty_note {
+            let _ = std::fs::remove_file(&tab.path); // like Notes, empty notes don't stick around
+        } else {
+            self.closed.push((tab.path, line));
+        }
         if self.closed.len() > MAX_CLOSED {
             self.closed.remove(0);
         }
@@ -697,6 +775,10 @@ impl Workspace {
     /// Saves the session and returns true if it's fine to quit now. With
     /// unsaved tabs it asks first and quits by itself if the user agrees.
     fn confirm_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let notes: Vec<u64> = self.tabs.iter().filter(|t| t.note && t.dirty).map(|t| t.id).collect();
+        for id in notes {
+            let _ = self.write_tab(id, cx);
+        }
         session::save(&self.session(cx));
         let dirty: Vec<u64> = self.tabs.iter().filter(|t| t.dirty).map(|t| t.id).collect();
         if dirty.is_empty() {
@@ -803,6 +885,20 @@ impl Workspace {
         self.cycle(-1, window, cx);
     }
 
+    fn on_new_note(&mut self, _: &NewNote, window: &mut Window, cx: &mut Context<Self>) {
+        match notes::create_new_note() {
+            Ok(path) => {
+                self.search.update(cx, |state, cx| state.set_value("", window, cx));
+                if let Some(ix) = self.open_paths(vec![path], cx).and_then(|id| self.index_of(id)) {
+                    self.tabs[ix].start_editing = true;
+                }
+            }
+            Err(err) => {
+                let _ = window.prompt(PromptLevel::Critical, "Could not create a note", Some(&err.to_string()), &["OK"], cx);
+            }
+        }
+    }
+
     fn on_toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_open = !self.sidebar_open;
         cx.notify();
@@ -834,10 +930,9 @@ impl Workspace {
         let theme = cx.theme();
         let dark = theme.mode.is_dark();
         let (muted, border, sidebar_bg, hover_bg) = (theme.muted_foreground, theme.border, theme.sidebar, theme.secondary);
-        let separator = border.opacity(0.6);
-        // Notes' highlight: a warm yellow, with text readable on it in both modes.
-        let (selected_bg, selected_fg): (Hsla, Hsla) =
-            if dark { (rgb(0x9a7b2c).into(), white()) } else { (rgb(0xf6d26b).into(), black()) };
+        let (sidebar_border, search_bg) = (theme.sidebar_border, theme.input.opacity(0.55));
+        let separator = border.opacity(0.45);
+        let (selected_bg, selected_fg) = style::selection_row(dark);
         let now = chrono::Local::now();
         let query = self.search.read(cx).value().to_lowercase();
 
@@ -860,10 +955,10 @@ impl Workspace {
                 rows.push(
                     div()
                         .px_3()
-                        .pt(if current_group.is_none() { px(4.) } else { px(18.) })
-                        .pb_1p5()
-                        .text_lg()
-                        .font_weight(FontWeight::BOLD)
+                        .pt(if current_group.is_none() { px(6.) } else { px(16.) })
+                        .pb_1()
+                        .text_base()
+                        .font_weight(FontWeight::SEMIBOLD)
                         .child(group.clone())
                         .into_any_element(),
                 );
@@ -890,16 +985,16 @@ impl Workspace {
                     .relative()
                     .gap_0p5()
                     .px_3()
-                    .py_2()
-                    .rounded_lg()
+                    .py(px(9.))
+                    .rounded(px(10.))
                     .when(selected, |row| row.bg(selected_bg).text_color(selected_fg))
                     .when(!selected, |row| row.hover(move |style| style.bg(hover_bg)))
                     .on_click(cx.listener(move |this, _, window, cx| this.activate(id, window, cx)))
-                    .child(div().pr_5().font_weight(FontWeight::BOLD).truncate().child(title))
+                    .child(div().pr_5().text_sm().font_weight(FontWeight::SEMIBOLD).truncate().child(title))
                     .child(
                         h_flex()
                             .gap_2()
-                            .text_sm()
+                            .text_xs()
                             .min_w_0()
                             .child(div().flex_none().child(date))
                             .child(div().min_w_0().truncate().text_color(sub_color).child(snippet.to_string())),
@@ -940,9 +1035,9 @@ impl Workspace {
             .flex_none()
             .h_full()
             // Translucent over the window's blur, like a macOS sidebar.
-            .bg(sidebar_bg.opacity(0.62))
+            .bg(sidebar_bg.opacity(0.78))
             .border_r_1()
-            .border_color(border)
+            .border_color(sidebar_border)
             .child(
                 h_flex()
                     .h(px(TOOLBAR_HEIGHT))
@@ -952,7 +1047,17 @@ impl Workspace {
                     .child(Self::drag_area().flex_1())
                     .child(self.sidebar_button(cx)),
             )
-            .child(div().px_3().pb_2().child(Input::new(&self.search).small().prefix(Icon::new(IconName::Search).xsmall())))
+            .child(
+                // A pill-shaped search field, like the macOS toolbar search.
+                div().px_3().pb_2().child(
+                    h_flex().h_7().px_2().rounded_full().bg(search_bg).child(
+                        Input::new(&self.search)
+                            .small()
+                            .appearance(false)
+                            .prefix(Icon::new(IconName::Search).xsmall().text_color(muted)),
+                    ),
+                ),
+            )
             .child(
                 div()
                     .id("file-list")
@@ -971,7 +1076,7 @@ impl Workspace {
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (muted, border) = (theme.muted_foreground, theme.border);
+        let muted = theme.muted_foreground;
         let tab = self.active_tab();
         let title = tab.map(|t| t.title.clone()).unwrap_or_else(|| "Leaf".into());
         // Short like Notes' "92 notes": folder name plus file facts. The full
@@ -1003,9 +1108,7 @@ impl Workspace {
             .h(px(TOOLBAR_HEIGHT))
             .flex_none()
             .pr_3()
-            .gap_1()
-            .border_b_1()
-            .border_color(border)
+            .gap_2()
             .when(!self.sidebar_open, |bar| {
                 bar.child(Self::drag_area().w(px(TRAFFIC_LIGHTS_WIDTH))).child(self.sidebar_button(cx))
             })
@@ -1013,7 +1116,7 @@ impl Workspace {
                 v_flex()
                     .min_w_0()
                     .pl_4()
-                    .child(div().font_weight(FontWeight::BOLD).truncate().child(title))
+                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).truncate().child(title))
                     .child(
                         h_flex()
                             .gap_2()
@@ -1026,6 +1129,15 @@ impl Workspace {
                     ),
             )
             .child(Self::drag_area().flex_1())
+            .child(
+                h_flex().flex_none().p_0p5().rounded_full().bg(capsule_bg).child(
+                    Button::new("new-note")
+                        .ghost()
+                        .icon(IconName::SquarePen)
+                        .tooltip("New Note (⌘N)")
+                        .on_click(cx.listener(|this, _, window, cx| this.on_new_note(&NewNote, window, cx))),
+                ),
+            )
             .when(tab.is_some_and(|t| t.is_live()), |bar| {
                 bar.child(
                     // Grouped in a capsule, like Notes' toolbar buttons.
@@ -1039,7 +1151,7 @@ impl Workspace {
                         .child(
                             Button::new("edit")
                                 .ghost()
-                                .icon(if editing { IconName::Check } else { IconName::SquarePen })
+                                .icon(if editing { IconName::Check } else { IconName::Pencil })
                                 .label(if editing { "Done" } else { "Edit" })
                                 .tooltip("Edit (⌘E or double-click)")
                                 .on_click(cx.listener(|this, _, window, cx| this.on_toggle_edit(&ToggleEdit, window, cx))),
@@ -1072,11 +1184,25 @@ impl Workspace {
                 v_flex()
                     .size_full()
                     .when_some(date, |page, date| {
-                        page.child(div().flex_none().w_full().pt_3().pb_2().text_center().text_sm().text_color(muted).child(date))
+                        page.child(div().flex_none().w_full().pt_4().pb_3().text_center().text_xs().text_color(muted.opacity(0.85)).child(date))
                     })
                     .child(div().flex_1().min_h_0().child(viewer.clone()))
                     .into_any_element()
             }
+            TabState::Editing { editor, prose: true, .. } => div()
+                .size_full()
+                .pl_6()
+                .pt_2()
+                .child(
+                    Editor::new(editor)
+                        .bordered(false)
+                        .appearance(false)
+                        .h(relative(1.))
+                        .font_family(cx.theme().font_family.clone())
+                        .text_size(px(15.))
+                        .line_height(relative(1.55)),
+                )
+                .into_any_element(),
             TabState::Editing { editor, .. } => Editor::new(editor).bordered(false).h(relative(1.)).into_any_element(),
             TabState::Message(message) => centered(message.clone()),
             TabState::Cold | TabState::Loading => div().size_full().into_any_element(),
@@ -1094,9 +1220,14 @@ impl Workspace {
                 details.push(status);
             }
         }
-        if let Some(doc) = tab.doc(cx) {
-            details.push(format!("{} lines", doc.line_count()));
+        // While editing, the loaded document's numbers would be stale.
+        if let (Some(doc), TabState::Viewing { .. }) = (tab.doc(cx), &tab.state) {
+            let lines = doc.line_count();
+            details.push(if lines == 1 { "1 line".into() } else { format!("{lines} lines") });
             details.push(doc::human_size(doc.len() as u64));
+        }
+        if tab.is_live() {
+            let doc = tab.doc(cx).expect("live tabs have a document");
             let mut encoding = tab.format.label();
             if doc.lossy {
                 encoding.push_str(" (lossy)");
@@ -1139,6 +1270,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_next))
             .on_action(cx.listener(Self::on_prev))
             .on_action(cx.listener(Self::on_toggle_sidebar))
+            .on_action(cx.listener(Self::on_new_note))
             .on_action(cx.listener(Self::on_focus_search))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.open_paths(paths.paths().to_vec(), cx);

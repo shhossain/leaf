@@ -50,6 +50,11 @@ pub enum RichKind {
     Prose,
 }
 
+/// Markdown and plain text: shown and edited as pages, not numbered code.
+pub fn is_page_file(path: &Path) -> bool {
+    rich_kind(path).is_some()
+}
+
 fn rich_kind(path: &Path) -> Option<RichKind> {
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase());
     match ext.as_deref() {
@@ -57,6 +62,38 @@ fn rich_kind(path: &Path) -> Option<RichKind> {
         Some("txt" | "text") => Some(RichKind::Prose),
         _ => None,
     }
+}
+
+/// How Notes shows a note: the first line is the title, and every Return is
+/// a line break (plain Markdown would join lines into one paragraph). Fenced
+/// code blocks are left alone.
+fn note_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut in_fence = false;
+    let mut titled = false;
+    let lines: Vec<&str> = text.lines().collect();
+    for (ix, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+        }
+        if !titled && !trimmed.is_empty() {
+            titled = true;
+            if !trimmed.starts_with('#') && !in_fence {
+                out.push_str("# ");
+                out.push_str(trimmed);
+                out.push_str("\n\n");
+                continue;
+            }
+        }
+        out.push_str(line);
+        let next_has_text = lines.get(ix + 1).is_some_and(|l| !l.trim().is_empty());
+        if !in_fence && !trimmed.is_empty() && next_has_text {
+            out.push_str("  "); // two trailing spaces: a hard line break
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// Escapes plain text so the Markdown renderer shows it verbatim: every ASCII
@@ -168,6 +205,8 @@ pub struct Viewer {
     base_dir: PathBuf,
     /// Where a double-click asked to start editing; read by the workspace.
     edit_at: Option<Pos>,
+    /// In the Leaf Notes folder: rendered the way Notes shows notes.
+    note: bool,
 }
 
 impl Viewer {
@@ -200,6 +239,7 @@ impl Viewer {
             preview: None,
             base_dir: path.parent().map(Path::to_path_buf).unwrap_or_default(),
             edit_at: None,
+            note: crate::notes::is_note(path),
         };
         // Viewer-first: Markdown opens rendered and text reads like Notes;
         // ⌘⇧V switches to numbered source lines.
@@ -210,7 +250,11 @@ impl Viewer {
     fn build_preview(&self) -> Option<SharedString> {
         let text = || self.doc.text(0..self.doc.len());
         match self.rich? {
-            RichKind::Markdown if self.doc.len() <= MAX_PREVIEW_BYTES => Some(text().into_owned().into()),
+            RichKind::Markdown if self.doc.len() <= MAX_PREVIEW_BYTES => Some(if self.note {
+                note_markdown(&text()).into()
+            } else {
+                text().into_owned().into()
+            }),
             RichKind::Prose if self.doc.len() <= MAX_PROSE_BYTES => Some(plain_to_markdown(&text()).into()),
             _ => None,
         }
@@ -265,8 +309,8 @@ impl Viewer {
                         }
                     })
                     .size_full()
-                    .px_10()
-                    .pb_6(),
+                    .px(px(56.))
+                    .pb_10(),
             )
     }
 
@@ -469,7 +513,7 @@ impl Viewer {
                             .w(gutter_width)
                             .pr_4()
                             .text_right()
-                            .text_color(muted)
+                            .text_color(muted.opacity(0.6))
                             .child(SharedString::from((line + 1).to_string())),
                     )
                     .child(StyledText::new(display.text).with_highlights(highlights))
@@ -917,6 +961,12 @@ mod tests {
         use super::plain_to_markdown;
         let out = plain_to_markdown("# not a heading\n  * not a list\nlast\n\nnext para");
         assert_eq!(out, "\\# not a heading\\\n\u{a0}\u{a0}\\* not a list\\\nlast\n\nnext para\n");
+    }
+
+    #[test]
+    fn notes_get_a_title_and_line_breaks() {
+        let out = super::note_markdown("Weekend plans\nHike\nLunch\n\n```\na\nb\n```");
+        assert_eq!(out, "# Weekend plans\n\nHike  \nLunch\n\n```\na\nb\n```\n");
     }
 
     #[test]

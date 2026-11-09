@@ -4,7 +4,9 @@ mod doc;
 mod encoding;
 mod file_list;
 mod highlight;
+mod notes;
 mod session;
+mod style;
 mod text_index;
 mod viewer;
 mod workspace;
@@ -20,7 +22,7 @@ use workspace::Workspace;
 
 actions!(
     leaf,
-    [Quit, OpenFile, Save, CloseTab, ReopenClosed, ToggleEdit, NextTab, PrevTab, ToggleSidebar, FocusSearch]
+    [Quit, OpenFile, Save, CloseTab, ReopenClosed, ToggleEdit, NextTab, PrevTab, ToggleSidebar, FocusSearch, NewNote]
 );
 
 fn main() {
@@ -98,6 +100,7 @@ fn menus() -> Vec<Menu> {
         Menu {
             name: "File".into(),
             items: vec![
+                MenuItem::action("New Note", NewNote),
                 MenuItem::action("Open…", OpenFile),
                 MenuItem::action("Save", Save),
                 MenuItem::separator(),
