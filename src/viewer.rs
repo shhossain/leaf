@@ -21,7 +21,7 @@ use gpui_kit::*;
 use futures::StreamExt as _;
 
 use crate::highlight::{self, CHUNK, Spans};
-use crate::text_index::{DisplayLine, Document};
+use crate::text_index::{Bytes, DisplayLine, Document};
 
 actions!(
     viewer,
@@ -50,11 +50,15 @@ pub enum RichKind {
     Markdown,
     /// `.txt`: Notes-style prose — proportional font, wrapped, no line numbers.
     Prose,
+    /// `.json`: pretty-printed (formatted view of minified JSON).
+    Json,
+    /// `.csv` / `.tsv`: columns.
+    Table,
 }
 
 /// Markdown and plain text: shown and edited as pages, not numbered code.
 pub fn is_page_file(path: &Path) -> bool {
-    rich_kind(path).is_some()
+    matches!(rich_kind(path), Some(RichKind::Markdown | RichKind::Prose))
 }
 
 fn rich_kind(path: &Path) -> Option<RichKind> {
@@ -62,6 +66,8 @@ fn rich_kind(path: &Path) -> Option<RichKind> {
     match ext.as_deref() {
         Some("md" | "markdown" | "mdown" | "mkd" | "mdx") => Some(RichKind::Markdown),
         Some("txt" | "text") => Some(RichKind::Prose),
+        Some("json" | "geojson" | "jsonc" | "webmanifest") => Some(RichKind::Json),
+        Some("csv" | "tsv" | "tab") => Some(RichKind::Table),
         _ => None,
     }
 }
@@ -216,11 +222,18 @@ pub struct Viewer {
     gutter_width: Pixels,
     font: Font,
     font_size: Pixels,
+    char_width: Pixels,
     rich: Option<RichKind>,
     /// Markdown being rendered while the page view (not numbered lines) shows.
     preview: Option<SharedString>,
     /// Folder of the file; relative image paths in Markdown resolve against it.
     base_dir: PathBuf,
+    /// While formatted JSON is shown: the file as it is on disk. `doc` then
+    /// holds the pretty-printed copy; edits and saves use this one.
+    raw: Option<Arc<Document>>,
+    _format_task: Option<Task<()>>,
+    /// CSV/TSV shown as columns.
+    table: Option<TableLayout>,
     /// Where a double-click asked to start editing; read by the workspace.
     edit_at: Option<Pos>,
     /// In the Leaf Notes folder: rendered the way Notes shows notes.
@@ -254,15 +267,27 @@ impl Viewer {
             gutter_width: px(60.),
             font: font("Menlo"),
             font_size: px(13.),
+            char_width: px(8.),
             rich: rich_kind(path),
             preview: None,
             base_dir: path.parent().map(Path::to_path_buf).unwrap_or_default(),
             edit_at: None,
+            raw: None,
+            _format_task: None,
+            table: None,
             note: crate::notes::is_note(path),
         };
         // Viewer-first: Markdown opens rendered and text reads like Notes;
         // ⌘⇧V switches to numbered source lines.
         this.preview = this.build_preview();
+        match this.rich {
+            Some(RichKind::Table) => this.table = TableLayout::detect(&this.doc, path),
+            // Minified JSON (one huge line) opens formatted; tidy JSON as is.
+            Some(RichKind::Json) if this.doc.line_range(this.doc.longest_line()).len() > 1000 => {
+                this.show_formatted_json(cx)
+            }
+            _ => {}
+        }
         if let Some(syntax) = syntax {
             let (tx, mut rx) = futures::channel::mpsc::unbounded();
             this.highlighter = Some(highlight::Worker::spawn(this.doc.clone(), syntax, tx));
@@ -292,7 +317,11 @@ impl Viewer {
 
     /// Showing a rendered page (Markdown or prose) rather than numbered lines.
     pub fn page_kind(&self) -> Option<RichKind> {
-        self.preview.as_ref().and(self.rich)
+        match self.rich? {
+            RichKind::Markdown | RichKind::Prose => self.preview.as_ref().and(self.rich),
+            RichKind::Json => self.raw.as_ref().and(self.rich),
+            RichKind::Table => self.table.as_ref().and(self.rich),
+        }
     }
 
     pub fn can_toggle_page(&self) -> bool {
@@ -305,10 +334,55 @@ impl Viewer {
 
     /// Switches between the rendered page and numbered source lines.
     pub fn toggle_page(&mut self, cx: &mut Context<Self>) {
-        if self.preview.take().is_none() {
-            self.preview = self.build_preview();
+        match self.rich {
+            Some(RichKind::Json) => match self.raw.take() {
+                Some(raw) => self.swap_doc(raw),
+                None => self.show_formatted_json(cx),
+            },
+            Some(RichKind::Table) => {
+                self.table = match self.table.take() {
+                    Some(_) => None,
+                    None => TableLayout::detect(&self.doc, Path::new(".csv")),
+                };
+            }
+            _ => {
+                if self.preview.take().is_none() {
+                    self.preview = self.build_preview();
+                }
+            }
         }
         cx.notify();
+    }
+
+    /// Pretty-prints the JSON in the background and shows that instead.
+    fn show_formatted_json(&mut self, cx: &mut Context<Self>) {
+        let doc = self.doc.clone();
+        self._format_task = Some(cx.spawn(async move |this, cx| {
+            let pretty = cx.background_executor().spawn(async move { pretty_json(&doc) }).await;
+            this.update(cx, |viewer, cx| {
+                if let Some(text) = pretty {
+                    let raw = viewer.doc.clone();
+                    viewer.swap_doc(Arc::new(Document::new(Bytes::Owned(text), false)));
+                    viewer.raw = Some(raw);
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Shows a different text (formatted / original) from the top.
+    fn swap_doc(&mut self, doc: Arc<Document>) {
+        self.doc = doc;
+        self.generation += 1;
+        self.chunk_cache.clear();
+        self.pending_chunks.clear();
+        if let Some(highlighter) = &self.highlighter {
+            highlighter.set_document(self.doc.clone(), self.generation, 0);
+        }
+        (self.find, self.filter, self.anchor) = (None, None, None);
+        self.head = Pos::default();
+        self.pending_scroll = Some((0, false));
     }
 
     fn render_preview(&self, text: SharedString, cx: &mut Context<Self>) -> impl IntoElement {
@@ -344,13 +418,21 @@ impl Viewer {
             )
     }
 
+    /// The file as it is on disk (not the formatted copy).
     pub fn doc(&self) -> &Arc<Document> {
-        &self.doc
+        self.raw.as_ref().unwrap_or(&self.doc)
     }
 
     /// Swaps in a newer version of the same file (it grew on disk). If the
     /// reader was at the bottom, the view follows the new lines, like `tail -f`.
     pub fn replace_doc(&mut self, doc: Arc<Document>, cx: &mut Context<Self>) {
+        if self.raw.is_some() {
+            // Formatted JSON: re-format the new version.
+            self.raw = None;
+            self.swap_doc(doc);
+            self.show_formatted_json(cx);
+            return;
+        }
         let old_lines = self.doc.line_count();
         let at_bottom = {
             let handle = self.scroll.0.borrow().base_handle.clone();
@@ -557,6 +639,11 @@ impl Viewer {
                 backgrounds.push((to_display(from..to), selection_bg));
             }
 
+            if let Some(table) = &self.table {
+                let selected = selection.is_some_and(|(s, e)| (s.line..=e.line).contains(&line));
+                rows.push(self.render_table_row(table, line, &self.doc.slice(source.clone()), selected, muted, selection_bg));
+                continue;
+            }
             let highlights = compose(&display.text, &colors, &backgrounds);
             rows.push(
                 h_flex()
@@ -578,6 +665,48 @@ impl Viewer {
             );
         }
         rows
+    }
+
+    fn render_table_row(
+        &self,
+        table: &TableLayout,
+        line: usize,
+        raw: &[u8],
+        selected: bool,
+        muted: Hsla,
+        selection_bg: Hsla,
+    ) -> AnyElement {
+        let header = line == 0;
+        let cells = split_row(&String::from_utf8_lossy(raw), table.delimiter);
+        h_flex()
+            .id(line)
+            .h(self.row_height)
+            .whitespace_nowrap()
+            .when(selected, |row| row.bg(selection_bg))
+            .when(header, |row| row.font_weight(FontWeight::SEMIBOLD))
+            .child(
+                div()
+                    .flex_none()
+                    .w(self.gutter_width)
+                    .pr_4()
+                    .text_right()
+                    .text_color(muted.opacity(0.6))
+                    .child(SharedString::from((line + 1).to_string())),
+            )
+            .children(table.widths.iter().enumerate().map(|(column, chars)| {
+                let text = cells.get(column).cloned().unwrap_or_default();
+                div()
+                    .flex_none()
+                    .w(self.char_width * (*chars as f32 + 2.))
+                    .h_full()
+                    .px_2()
+                    .border_r_1()
+                    .border_color(muted.opacity(0.25))
+                    .when(header, |cell| cell.border_b_1())
+                    .overflow_hidden()
+                    .child(text)
+            }))
+            .into_any_element()
     }
 
     // ── selection & mouse ──────────────────────────────────────────────────
@@ -955,6 +1084,7 @@ impl Render for Viewer {
             .map(|size| size.width)
             .unwrap_or(self.font_size * 0.6);
         self.gutter_width = char_width * (digits + 3.);
+        self.char_width = char_width;
         self.apply_pending_scroll(window, cx);
         let theme = cx.theme();
         let (muted, border) = (theme.muted_foreground, theme.border);
@@ -966,7 +1096,11 @@ impl Render for Viewer {
         )
         .track_scroll(&self.scroll)
         .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
-        .with_width_from_item(self.filtered().is_none().then(|| self.doc.longest_line()))
+        .with_width_from_item(if self.table.is_some() {
+            Some(0)
+        } else {
+            self.filtered().is_none().then(|| self.doc.longest_line())
+        })
         .size_full();
 
         v_flex()
@@ -1117,6 +1251,76 @@ fn matching_lines(doc: &Document, query: &str) -> (Vec<usize>, bool) {
     (lines, truncated)
 }
 
+/// Column layout for CSV/TSV: the delimiter and each column's width in
+/// characters, sampled from the first rows.
+struct TableLayout {
+    delimiter: char,
+    widths: Vec<usize>,
+}
+
+impl TableLayout {
+    const SAMPLE_ROWS: usize = 300;
+    const MAX_COLUMN_CHARS: usize = 40;
+
+    fn detect(doc: &Document, path: &Path) -> Option<Self> {
+        let tsv = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("tsv") || e.eq_ignore_ascii_case("tab"));
+        let first = doc.text(doc.line_range(0)).into_owned();
+        let delimiter = if tsv || first.matches('\t').count() > first.matches(',').count() {
+            '\t'
+        } else if first.matches(';').count() > first.matches(',').count() {
+            ';' // European CSV
+        } else {
+            ','
+        };
+        let mut widths: Vec<usize> = Vec::new();
+        for range in doc.line_ranges(0..Self::SAMPLE_ROWS) {
+            for (column, cell) in split_row(&doc.text(range), delimiter).iter().enumerate() {
+                let chars = cell.chars().count().clamp(3, Self::MAX_COLUMN_CHARS);
+                match widths.get_mut(column) {
+                    Some(width) => *width = (*width).max(chars),
+                    None => widths.push(chars),
+                }
+            }
+        }
+        (widths.len() > 1).then_some(Self { delimiter, widths })
+    }
+}
+
+/// Splits one CSV line into cells. Quoted cells may contain the delimiter,
+/// and a doubled quote inside them stands for one quote character.
+fn split_row(line: &str, delimiter: char) -> Vec<String> {
+    let (mut cells, mut cell, mut quoted) = (Vec::new(), String::new(), false);
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                cell.push('"');
+                chars.next();
+            }
+            '"' => quoted = !quoted,
+            c if c == delimiter && !quoted => cells.push(std::mem::take(&mut cell)),
+            c => cell.push(c),
+        }
+    }
+    cells.push(cell);
+    cells
+}
+
+/// Pretty-printed JSON (keys in their original order), if `doc` parses.
+fn pretty_json(doc: &Document) -> Option<Vec<u8>> {
+    const MAX_FORMAT_BYTES: usize = 16 * 1024 * 1024;
+    if doc.len() > MAX_FORMAT_BYTES {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&doc.slice(0..doc.len())).ok()?;
+    let mut out = Vec::with_capacity(doc.len() * 2);
+    let formatter = serde_json::ser::PrettyFormatter::with_indent(b"  ");
+    let mut serializer = serde_json::Serializer::with_formatter(&mut out, formatter);
+    serde::Serialize::serialize(&value, &mut serializer).ok()?;
+    out.push(b'\n');
+    Some(out)
+}
+
 /// Flattens color spans and background spans into the sorted, non-overlapping
 /// runs `StyledText` expects. Later backgrounds win (selection is pushed last).
 fn compose(
@@ -1192,6 +1396,23 @@ mod tests {
         assert_eq!(super::matching_lines(&doc, "ERROR"), (vec![1], false));
         assert_eq!(super::matching_lines(&doc, "/^(WARN|ERROR)/"), (vec![1, 3], false));
         assert_eq!(super::matching_lines(&doc, ""), (vec![], false));
+    }
+
+    #[test]
+    fn splits_csv_rows_with_quotes() {
+        assert_eq!(super::split_row(r#"a,"b,c",d"#, ','), ["a", "b,c", "d"]);
+        assert_eq!(super::split_row(r#"x;"say ""hi""""#, ';'), ["x", r#"say "hi""#]);
+        assert_eq!(super::split_row("", ','), [""]);
+    }
+
+    #[test]
+    fn formats_json_keeping_key_order() {
+        use crate::text_index::Bytes;
+        let doc = Document::new(Bytes::Owned(br#"{"z":1,"a":[true,null]}"#.to_vec()), true);
+        let out = String::from_utf8(super::pretty_json(&doc).unwrap()).unwrap();
+        assert_eq!(out, "{\n  \"z\": 1,\n  \"a\": [\n    true,\n    null\n  ]\n}\n");
+        let bad = Document::new(Bytes::Owned(b"{nope".to_vec()), true);
+        assert!(super::pretty_json(&bad).is_none());
     }
 
     #[test]

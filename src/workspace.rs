@@ -28,7 +28,7 @@ use crate::file_list::{self, FileMeta};
 use crate::{notes, recovery, style};
 use crate::session::{self, Session, SessionTab};
 use crate::text_index::{Bytes, Document};
-use crate::viewer::Viewer;
+use crate::viewer::{RichKind, Viewer};
 use crate::{
     CloseTab, FocusSearch, NewNote, NextTab, OpenFile, PrevTab, Quit, ReopenClosed, Save, ToggleEdit, ToggleSidebar,
 };
@@ -1455,7 +1455,8 @@ impl Workspace {
         match &tab.state {
             TabState::Viewing { viewer, .. } => {
                 // Pages (Markdown, prose) get Notes' date line above the text.
-                let date = viewer.read(cx).page_kind().and(tab.modified()).map(|m| file_list::full_date(file_list::local(m)));
+                let prose = matches!(viewer.read(cx).page_kind(), Some(RichKind::Markdown | RichKind::Prose));
+                let date = tab.modified().filter(|_| prose).map(|m| file_list::full_date(file_list::local(m)));
                 v_flex()
                     .size_full()
                     .when_some(date, |page, date| {
