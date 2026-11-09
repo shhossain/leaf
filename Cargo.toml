@@ -1,0 +1,30 @@
+[package]
+name = "leaf"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight, viewer-first text editor for macOS with lazy tabs"
+license = "Apache-2.0"
+
+[dependencies]
+# gpui-kit pins the matching `gpui-pre` snapshot crates itself (=0.3.11 for 0.9.0).
+# `syntect`: ~200 languages, small build. Swap to `tree-sitter` features later if needed.
+gpui-kit = { version = "=0.9.0", features = ["syntect"] }
+futures = "0.3"
+memchr = "2"
+memmap2 = "0.9"
+regex = "1"
+# Same versions/features gpui-component already compiles, so no extra build cost.
+syntect = { version = "5.3", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }
+two-face = { version = "0.4.5", default-features = false, features = ["syntect-fancy"] }
+
+# Disk-lean dev builds: no debug info, optimized dependencies (GPUI is slow unoptimized).
+[profile.dev]
+debug = 0
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+debug = 0
+lto = "thin"
+strip = true
