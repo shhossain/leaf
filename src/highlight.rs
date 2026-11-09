@@ -1,13 +1,14 @@
 //! Syntax highlighting for the viewer, done only for lines on screen.
 //!
-//! syntect is line-at-a-time and stateful, so a background pass records the
-//! parser state every `CHUNK` lines. Highlighting a visible chunk then starts
-//! from its checkpoint and parses at most `CHUNK` lines.
+//! syntect is line-at-a-time and stateful, so the parser state is recorded
+//! every `CHUNK` lines. Highlighting a visible chunk then starts from its
+//! checkpoint and parses at most `CHUNK` lines. All parsing happens on one
+//! [`Worker`] thread per open file, never on the UI thread.
 
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::Path;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet};
 
@@ -17,7 +18,7 @@ pub const CHUNK: usize = 128;
 /// Bigger files are shown without highlighting.
 pub const MAX_HIGHLIGHT_BYTES: usize = 16 * 1024 * 1024;
 /// Only the start of a very long line is parsed.
-const MAX_PARSE_LINE: usize = 20_000;
+const MAX_PARSE_LINE: usize = 4_000;
 
 static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_newlines);
 
@@ -94,6 +95,114 @@ pub fn highlight(doc: &Document, mut state: LineState, lines: Range<usize>) -> V
             spans
         })
         .collect()
+}
+
+/// Chunks the exact pass walks past its last checkpoint for one request.
+/// Farther jumps (⌘↓ in a big file) keep approximate colors rather than
+/// parsing everything in between.
+const MAX_EXACT_GAP_CHUNKS: usize = 50;
+/// Lines parsed before a chunk when highlighting it without exact state.
+const WARMUP_LINES: usize = 64;
+
+/// Colors for one chunk, sent from the highlighter thread.
+pub struct Highlighted {
+    pub chunk: usize,
+    pub generation: u64,
+    /// No better version of this chunk is coming.
+    pub last: bool,
+    pub spans: Vec<Spans>,
+}
+
+enum Message {
+    Chunk(usize),
+    Document { doc: Arc<Document>, generation: u64, keep_chunks: usize },
+}
+
+/// A viewer's own highlighting thread. It owns every bit of parser state
+/// (syntect's Oniguruma state can't cross threads), so the UI thread only
+/// sends chunk numbers and receives finished spans — it never parses.
+/// Dropping the worker ends the thread.
+pub struct Worker {
+    tx: std::sync::mpsc::Sender<Message>,
+}
+
+impl Worker {
+    pub fn spawn(
+        doc: Arc<Document>,
+        syntax: &'static SyntaxReference,
+        out: futures::channel::mpsc::UnboundedSender<Highlighted>,
+    ) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = std::thread::Builder::new()
+            .name("leaf-highlight".into())
+            .spawn(move || run(rx, doc, syntax, out));
+        Self { tx }
+    }
+
+    pub fn request(&self, chunk: usize) {
+        let _ = self.tx.send(Message::Chunk(chunk));
+    }
+
+    /// The file grew: chunks before `keep_chunks` are still valid.
+    pub fn set_document(&self, doc: Arc<Document>, generation: u64, keep_chunks: usize) {
+        let _ = self.tx.send(Message::Document { doc, generation, keep_chunks });
+    }
+}
+
+fn run(
+    rx: std::sync::mpsc::Receiver<Message>,
+    mut doc: Arc<Document>,
+    syntax: &'static SyntaxReference,
+    out: futures::channel::mpsc::UnboundedSender<Highlighted>,
+) {
+    let mut checkpoints = vec![LineState::new(syntax)];
+    let mut generation = 0;
+    while let Ok(first) = rx.recv() {
+        let mut chunks: Vec<usize> = Vec::new();
+        for message in std::iter::once(first).chain(rx.try_iter()) {
+            match message {
+                Message::Chunk(chunk) if !chunks.contains(&chunk) => chunks.push(chunk),
+                Message::Chunk(_) => {}
+                Message::Document { doc: new_doc, generation: new_generation, keep_chunks } => {
+                    (doc, generation) = (new_doc, new_generation);
+                    checkpoints.truncate(keep_chunks.max(1));
+                    chunks.clear();
+                }
+            }
+        }
+        // Newest requests first: they're what's on screen now.
+        for chunk in chunks.into_iter().rev() {
+            let start = chunk * CHUNK;
+            if start >= doc.line_count() {
+                continue;
+            }
+            let send = |last: bool, spans: Vec<Spans>| out.unbounded_send(Highlighted { chunk, generation, last, spans });
+            if chunk < checkpoints.len() {
+                if send(true, highlight(&doc, checkpoints[chunk].clone(), start..start + CHUNK)).is_err() {
+                    return;
+                }
+                continue;
+            }
+            // Best guess right away: parse from a fresh state a little earlier.
+            let warm = start.saturating_sub(WARMUP_LINES);
+            let mut guess = highlight(&doc, LineState::new(syntax), warm..start + CHUNK);
+            guess.drain(..(start - warm).min(guess.len()));
+            let reachable = chunk < checkpoints.len() + MAX_EXACT_GAP_CHUNKS;
+            if send(!reachable, guess).is_err() {
+                return;
+            }
+            if reachable {
+                while checkpoints.len() <= chunk {
+                    let k = checkpoints.len() - 1;
+                    let next = advance(&doc, checkpoints[k].clone(), k * CHUNK..(k + 1) * CHUNK);
+                    checkpoints.push(next);
+                }
+                if send(true, highlight(&doc, checkpoints[chunk].clone(), start..start + CHUNK)).is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Default)]

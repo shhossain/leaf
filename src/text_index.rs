@@ -22,7 +22,7 @@ const BLOCK: usize = 256 * 1024;
 /// Blocks kept in memory per file (16 MB).
 const CACHED_BLOCKS: usize = 64;
 /// Sequential read size when indexing or searching a file on disk.
-pub const SCAN_CHUNK: usize = 4 * 1024 * 1024;
+pub const SCAN_CHUNK: usize = 1024 * 1024;
 /// Visible tab width in columns.
 pub const TAB_WIDTH: usize = 4;
 /// Lines longer than this are cut for display (minified JSON, logs).

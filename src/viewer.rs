@@ -2,7 +2,7 @@
 //! [`Document`]. Memory is the file plus a small line index; the full editor
 //! is created only when the user switches a tab to edit mode.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -18,9 +18,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use syntect::parsing::SyntaxReference;
+use futures::StreamExt as _;
 
-use crate::highlight::{self, CHUNK, LineState, Spans};
+use crate::highlight::{self, CHUNK, Spans};
 use crate::text_index::{DisplayLine, Document};
 
 actions!(
@@ -34,14 +34,8 @@ actions!(
 /// Highlighted chunks kept around for scrolling back and forth.
 const CHUNK_CACHE: usize = 8;
 const MAX_MATCHES: usize = 100_000;
-/// Lines parsed before a chunk when highlighting it without exact state.
-const WARMUP_LINES: usize = 64;
 /// Frames to wait for the line list's first layout before dropping a scroll.
 const MAX_SCROLL_RETRIES: u8 = 5;
-/// The exact highlighting pass only walks this many chunks ahead of its last
-/// checkpoint. A far jump (⌘↓ in a big file) keeps the approximate colors
-/// instead of parsing everything in between (~23 s of CPU for 7 MB).
-const MAX_EXACT_GAP_CHUNKS: usize = 50;
 /// Markdown bigger than this opens as source; rendering it all would be slow.
 const MAX_PREVIEW_BYTES: usize = 4 * 1024 * 1024;
 /// Plain text above this keeps the line-based view (it's virtualized; prose isn't).
@@ -183,14 +177,15 @@ pub struct Viewer {
     focus: FocusHandle,
     scroll: UniformListScrollHandle,
     /// Parser state at the start of chunk `k` (line `k * CHUNK`).
-    syntax: Option<&'static SyntaxReference>,
-    checkpoints: Vec<LineState>,
-    /// The background pass stops once it has a checkpoint for this chunk.
-    wanted_chunk: usize,
-    pass_running: bool,
-    /// `(chunk, exact, spans)`; inexact entries are replaced once the pass catches up.
+    /// The file's highlighting thread (None: plain text).
+    highlighter: Option<highlight::Worker>,
+    /// `(chunk, final, spans)`; a non-final entry gets replaced by exact colors.
     chunk_cache: VecDeque<(usize, bool, Rc<Vec<Spans>>)>,
-    _checkpoint_task: Option<Task<()>>,
+    /// Chunks asked for whose final colors haven't arrived.
+    pending_chunks: HashSet<usize>,
+    /// Bumped when the document is replaced, to drop stale results.
+    generation: u64,
+    _highlight_results: Option<Task<()>>,
     anchor: Option<Pos>,
     head: Pos,
     dragging: bool,
@@ -225,12 +220,11 @@ impl Viewer {
             doc,
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
-            syntax,
-            checkpoints: Vec::new(),
-            wanted_chunk: 0,
-            pass_running: false,
+            highlighter: None,
             chunk_cache: VecDeque::new(),
-            _checkpoint_task: None,
+            pending_chunks: HashSet::new(),
+            generation: 0,
+            _highlight_results: None,
             anchor: None,
             head: Pos::default(),
             dragging: false,
@@ -252,6 +246,17 @@ impl Viewer {
         // Viewer-first: Markdown opens rendered and text reads like Notes;
         // ⌘⇧V switches to numbered source lines.
         this.preview = this.build_preview();
+        if let Some(syntax) = syntax {
+            let (tx, mut rx) = futures::channel::mpsc::unbounded();
+            this.highlighter = Some(highlight::Worker::spawn(this.doc.clone(), syntax, tx));
+            this._highlight_results = Some(cx.spawn(async move |viewer, cx| {
+                while let Some(result) = rx.next().await {
+                    if viewer.update(cx, |viewer, cx| viewer.on_highlighted(result, cx)).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
         this
     }
 
@@ -337,8 +342,12 @@ impl Viewer {
         self.doc = doc;
         // Highlighting before the old last chunk is still right; redo the rest.
         let last_chunk = (old_lines - 1) / CHUNK;
+        self.generation += 1;
         self.chunk_cache.retain(|(chunk, ..)| *chunk < last_chunk);
-        self.checkpoints.truncate(last_chunk + 1);
+        self.pending_chunks.clear();
+        if let Some(highlighter) = &self.highlighter {
+            highlighter.set_document(self.doc.clone(), self.generation, last_chunk + 1);
+        }
         if self.preview.is_some() {
             self.preview = self.build_preview();
         }
@@ -405,7 +414,7 @@ impl Viewer {
                 format!("{chars} lines selected")
             });
         }
-        if self.pass_running {
+        if !self.pending_chunks.is_empty() {
             parts.push("highlighting…".into());
         }
         parts.join("  ·  ")
@@ -413,88 +422,30 @@ impl Viewer {
 
     // ── syntax highlighting ────────────────────────────────────────────────
 
-    /// Asks the background pass for exact parser state up to `chunk`. The pass
-    /// only ever parses as far as the reader has scrolled, then idles.
-    fn want_chunk(&mut self, chunk: usize, cx: &mut Context<Self>) {
-        let Some(syntax) = self.syntax else { return };
-        if chunk > self.checkpoints.len() + MAX_EXACT_GAP_CHUNKS {
-            return;
+    /// Cached colors for `chunk`, or `None` (plain text) while the
+    /// highlighter thread works on them.
+    fn chunk_spans(&mut self, chunk: usize) -> Option<Rc<Vec<Spans>>> {
+        let highlighter = self.highlighter.as_ref()?;
+        if let Some((_, _, spans)) = self.chunk_cache.iter().find(|(c, ..)| *c == chunk) {
+            return Some(spans.clone());
         }
-        let total = self.doc.line_count().div_ceil(CHUNK);
-        self.wanted_chunk = self.wanted_chunk.max(chunk.min(total - 1));
-        if self.pass_running || self.checkpoints.len() > self.wanted_chunk {
-            return;
+        if self.pending_chunks.insert(chunk) {
+            highlighter.request(chunk);
         }
-        if self.checkpoints.is_empty() {
-            self.checkpoints.push(LineState::new(syntax));
-        }
-        self.pass_running = true;
-        let doc = self.doc.clone();
-        self._checkpoint_task = Some(cx.spawn(async move |this, cx| {
-            loop {
-                // Resume from the last checkpoint; at most 16 chunks (2048 lines) per batch.
-                let Ok((mut state, from, to)) = this.update(cx, |viewer, _| {
-                    let from = viewer.checkpoints.len() - 1;
-                    let to = (from + 16).min(viewer.wanted_chunk);
-                    (viewer.checkpoints[from].clone(), from, to)
-                }) else {
-                    return;
-                };
-                if to <= from {
-                    this.update(cx, |viewer, cx| {
-                        viewer.pass_running = false;
-                        cx.notify();
-                    })
-                    .ok();
-                    return;
-                }
-                let doc = doc.clone();
-                let batch = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let mut out = Vec::with_capacity(to - from);
-                        for c in from..to {
-                            state = highlight::advance(&doc, state, c * CHUNK..(c + 1) * CHUNK);
-                            out.push(state.clone());
-                        }
-                        out
-                    })
-                    .await;
-                let alive = this.update(cx, |viewer, cx| {
-                    viewer.checkpoints.extend(batch);
-                    cx.notify();
-                });
-                if alive.is_err() {
-                    return;
-                }
-            }
-        }));
+        None
     }
 
-    fn chunk_spans(&mut self, chunk: usize, cx: &mut Context<Self>) -> Option<Rc<Vec<Spans>>> {
-        let syntax = self.syntax?;
-        let exact = chunk < self.checkpoints.len();
-        if let Some((_, cached_exact, spans)) = self.chunk_cache.iter().find(|(c, ..)| *c == chunk) {
-            if *cached_exact || !exact {
-                return Some(spans.clone());
-            }
+    fn on_highlighted(&mut self, result: highlight::Highlighted, cx: &mut Context<Self>) {
+        if result.generation != self.generation {
+            return;
         }
-        self.want_chunk(chunk + 2, cx);
-        let start = chunk * CHUNK;
-        let spans = if exact {
-            highlight::highlight(&self.doc, self.checkpoints[chunk].clone(), start..start + CHUNK)
-        } else {
-            // Best guess until the exact pass arrives: start fresh a little earlier.
-            let warm = start.saturating_sub(WARMUP_LINES);
-            let mut spans = highlight::highlight(&self.doc, LineState::new(syntax), warm..start + CHUNK);
-            spans.drain(..(start - warm).min(spans.len()));
-            spans
-        };
-        let spans = Rc::new(spans);
-        self.chunk_cache.retain(|(c, ..)| *c != chunk);
-        self.chunk_cache.push_front((chunk, exact, spans.clone()));
+        if result.last {
+            self.pending_chunks.remove(&result.chunk);
+        }
+        self.chunk_cache.retain(|(c, ..)| *c != result.chunk);
+        self.chunk_cache.push_front((result.chunk, result.last, Rc::new(result.spans)));
         self.chunk_cache.truncate(CHUNK_CACHE);
-        Some(spans)
+        cx.notify();
     }
 
     // ── rows ───────────────────────────────────────────────────────────────
@@ -524,7 +475,7 @@ impl Viewer {
             let to_display = |r: Range<usize>| display.source_to_display(r.start)..display.source_to_display(r.end);
 
             let mut colors = Vec::new();
-            if let Some(spans) = self.chunk_spans(line / CHUNK, cx) {
+            if let Some(spans) = self.chunk_spans(line / CHUNK) {
                 for (span, name) in spans.get(line % CHUNK).into_iter().flatten() {
                     if let Some(style) = syntax_theme.style(name) {
                         colors.push((to_display(span.clone()), style));
@@ -952,7 +903,7 @@ fn search(doc: &Document, query: &str) -> Vec<Range<usize>> {
     if let Some(all) = doc.as_slice() {
         return regex.find_iter(all).take(MAX_MATCHES).map(|m| m.range()).collect();
     }
-    // On disk: search in large chunks that overlap by enough bytes for a match
+    // On disk: search in 1 MB chunks that overlap by enough bytes for a match
     // to straddle a boundary; each match belongs to the chunk it starts in.
     let overlap = query.len() * 4 + 16;
     let mut found: Vec<Range<usize>> = Vec::new();

@@ -37,6 +37,8 @@ use crate::{
 const MAX_LIVE: usize = 12;
 /// Closed tabs remembered for ⌘⇧T.
 const MAX_CLOSED: usize = 50;
+/// Files bigger than this are edited without syntax highlighting.
+const MAX_EDIT_HIGHLIGHT_BYTES: usize = 32 * 1024;
 const SIDEBAR_WIDTH: f32 = 290.;
 const TOOLBAR_HEIGHT: f32 = 52.;
 /// Room for the traffic lights, which sit inside the toolbar like in Notes.
@@ -676,7 +678,14 @@ impl Workspace {
                     return;
                 }
                 let text = doc.text(0..doc.len()).into_owned();
-                let language = doc::language_token(&self.tabs[ix].path);
+                // The editor reparses the whole document on the main thread
+                // after each pause; past 32 KB that lags typing, so big files
+                // edit as plain text (the viewer still highlights them).
+                let language = if doc.len() <= MAX_EDIT_HIGHLIGHT_BYTES {
+                    doc::language_token(&self.tabs[ix].path)
+                } else {
+                    "text".into()
+                };
                 let tab_size = TabSize { tab_size: crate::text_index::TAB_WIDTH, hard_tabs: doc::indents_with_tabs(&doc) };
                 let prose = crate::viewer::is_page_file(&self.tabs[ix].path);
                 let editor = cx.new(|cx| {

@@ -19,8 +19,17 @@ pub struct FileMeta {
     pub snippet: String,
 }
 
+/// macOS: the file's contents live only in iCloud (`SF_DATALESS`). Reading
+/// even 2 KB would download the whole file.
+const SF_DATALESS: u32 = 0x4000_0000;
+
 pub fn peek(path: &Path) -> FileMeta {
-    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    use std::os::macos::fs::MetadataExt as _;
+    let meta = std::fs::metadata(path).ok();
+    let modified = meta.as_ref().and_then(|m| m.modified().ok());
+    if meta.is_some_and(|m| m.st_flags() & SF_DATALESS != 0) {
+        return FileMeta { modified, snippet: "In iCloud".into() };
+    }
     let mut buf = Vec::with_capacity(PEEK_BYTES);
     let read = std::fs::File::open(path).and_then(|f| f.take(PEEK_BYTES as u64).read_to_end(&mut buf));
     if read.is_err() {

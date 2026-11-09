@@ -30,7 +30,7 @@ actions!(
 );
 
 fn main() {
-    let app = gpui_kit::application().with_assets(gpui_kit::assets::AllAssets);
+    let app = gpui_kit::application().with_assets(LeafAssets);
 
     // Finder "Open With", double-clicks, and drops on the Dock icon arrive as
     // file:// URLs — possibly before the window exists, so queue them.
@@ -92,6 +92,27 @@ fn main() {
 
         cx.activate(true);
     });
+}
+
+// The component library's default icons plus the few extra Lucide icons Leaf
+// uses, instead of embedding all ~1,800 (`AllAssets`, ~1 MB).
+gpui_kit::assets::icon_assets!(ExtraIcons, [BookOpen, Check, Code, FileText, Folder, PanelLeft, Pencil, Search, SquarePen]);
+
+struct LeafAssets;
+
+impl AssetSource for LeafAssets {
+    fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        match ExtraIcons.load(path)? {
+            Some(bytes) => Ok(Some(bytes)),
+            None => gpui_kit::assets::Assets.load(path),
+        }
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        let mut all = gpui_kit::assets::Assets.list(path)?;
+        all.extend(ExtraIcons.list(path)?);
+        Ok(all)
+    }
 }
 
 fn menus() -> Vec<Menu> {

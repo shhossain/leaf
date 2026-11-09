@@ -3,6 +3,7 @@
 //! greys, quiet separators and a warm yellow accent.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::component::theme::Theme;
@@ -63,6 +64,10 @@ pub fn apply(window: Option<&mut Window>, cx: &mut App) {
         c.scrollbar_thumb = alpha(0x000000, 0.20);
         c.scrollbar_thumb_hover = alpha(0x000000, 0.32);
     }
+    // Blink while typing, then hold still: an endless blink redraws the window
+    // twice a second, even in the background.
+    Theme::global_mut(cx).cursor_blink = gpui_kit::component::input::CursorBlink::blinking(Duration::from_millis(500))
+        .with_idle_timeout(Duration::from_secs(10));
     let syntax = syntax_theme(dark);
     match serde_json::from_value::<HighlightTheme>(syntax) {
         Ok(theme) => Theme::global_mut(cx).highlight_theme = Arc::new(theme),
